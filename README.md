@@ -11,7 +11,7 @@
 | --- | --- | --- | --- |
 | 🪟 **Windows** | **v3**（`大肥鱼桌宠改_D-16BVM`） | PowerShell 5.1 + 内嵌 C# | 见下文「Windows 版」 |
 | 🍎 **macOS** | **v1.3.1** | Swift + AppKit | 见下文「macOS 版」 |
-| 🌐 **DSH 网页插件** | 社区维护 | DSH bundle（JS） | 由 [@YCTS-otree](https://github.com/YCTS-otree) 移植并维护，见 [dsh-plugin 分支](https://github.com/YCTS-otree/VK-1) |
+| 🌐 **DSH 网页插件** | 社区维护 | DSH bundle（JS） | 由 [@YCTS-otree](https://github.com/YCTS-otree) 移植并维护，见其仓库的 [dsh-plugin 目录](https://github.com/YCTS-otree/VK-1) |
 | 🌐 **独立网页嵌入** | **v0.1.1** | 普通网页 JS + 可选 Python 余额服务 | 不依赖 DSH，可放进自己的网页，见下文「网页嵌入」 |
 
 Windows 版与 macOS 版**互不依赖**，各自独立运行；都只访问 DeepSeek 官方接口，不联网上传任何数据。网页插件版是第三方移植，见下。
@@ -255,14 +255,14 @@ macOS 版基于本仓库中的 Windows 原版移植，感谢原作者。原版�
 由 [@YCTS-otree](https://github.com/YCTS-otree) 把 `大肥鱼桌宠改_D-16BVM` 移植成了
 **DSH（DeepSeek Harness）网页插件**，作为 DSH 的一个 bundle 运行：
 
-**→ [`YCTS-otree/VK-1` · `dsh-plugin` 分支](https://github.com/YCTS-otree/VK-1)**
+**→ [`YCTS-otree/VK-1` · `dsh-plugin/` 目录](https://github.com/YCTS-otree/VK-1)**
 
 - 逐分结算（0.01 / 0.2s / 单轮 40 次上限）、四种表情的优先级状态机、掉盆按落高的弹跳、
   铁盆扣头与双击取下、火控雷达名牌与 10s 批量锁定 —— 行为按本仓库的实现对齐
 - 额外支持与 DSH 里其它余额显示插件**一键互切**（热生效，不需要刷新页面）
 - ⚠️ **形态差异**：网页插件没有原生置顶窗口、托盘和**屏幕角吸附**（只能吸附窗口角）；
   透明像素点击穿透仍然保留
-- 该分支**由 @YCTS-otree 独立维护**，不属于本仓库内容 —— 使用问题和建议请到他的仓库反馈
+- 该插件**由 @YCTS-otree 独立维护**，不属于本仓库内容 —— 使用问题和建议请到他的仓库反馈
 
 ## 贡献者
 
