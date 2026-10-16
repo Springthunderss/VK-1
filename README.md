@@ -9,7 +9,7 @@
 
 | 平台 | 当前版本 | 技术栈 | 说明 |
 | --- | --- | --- | --- |
-| 🪟 **Windows** | **v3**（`大肥鱼桌宠改_D-16BVM`） | PowerShell 5.1 + 内嵌 C# | 见下文「Windows 版」 |
+| 🪟 **Windows** | **v3** | PowerShell 5.1 + 内嵌 C# | 见下文「Windows 版」 |
 | 🍎 **macOS** | **v1.3.1** | Swift + AppKit | 见下文「macOS 版」 |
 | 🌐 **DSH 网页插件** | 社区维护 | DSH bundle（JS） | 由 [@YCTS-otree](https://github.com/YCTS-otree) 移植并维护，见其仓库的 [dsh-plugin 目录](https://github.com/YCTS-otree/VK-1) |
 | 🌐 **独立网页嵌入** | **v0.1.1** | 普通网页 JS + 可选 Python 余额服务 | 不依赖 DSH，可放进自己的网页，见下文「网页嵌入」 |
@@ -41,7 +41,7 @@ Windows 版与 macOS 版**互不依赖**，各自独立运行；都只访问 Dee
 不需要安装、不需要管理员权限 —— 双击就能跑。用 Windows 自带的 PowerShell 5.1
 现场编译内嵌的 C#，WinForms 无边框窗口 + 逐像素透明，透明区域鼠标穿透。
 
-![角色立绘](大肥鱼桌宠改_D-16BVM/sprite.png)
+![角色立绘](Windows/sprite.png)
 
 **v3 有三件好玩的：**
 
@@ -89,7 +89,7 @@ Windows 版与 macOS 版**互不依赖**，各自独立运行；都只访问 Dee
 
 1. 点右上角 **Code → Download ZIP**（或 `git clone`），解压到任意目录
    （路径里有中文也没关系，但**不要放在只读位置**）。
-2. 进入 **`大肥鱼桌宠改_D-16BVM/`** 目录 —— 这是当前版本。
+2. 进入 **`Windows/`** 目录。
 3. 双击 **`启动DSH余额宠物.vbs`**。
 4. 第一次启动会让你填自己的 DeepSeek API Key（`sk-` 开头）；不想填就先取消，
    挂件会离线显示 `--`，之后随时右键 →「设置 API Key」补上。
@@ -119,10 +119,10 @@ Windows 版与 macOS 版**互不依赖**，各自独立运行；都只访问 Dee
 
 | 版本 | 目录 | 状态 | 内容 |
 | --- | --- | --- | --- |
-| **v3** | [`大肥鱼桌宠改_D-16BVM`](大肥鱼桌宠改_D-16BVM) | **当前版本** | 表情差分 · 铁盆 · 多目标火控雷达 · PDF 说明书 |
-| v2 | [`大肥鱼桌宠改_D-16B`](大肥鱼桌宠改_D-16B) | 保留 | 拖拽惯性 · DSH 风格菜单第二版 |
-| v1 | [`大肥鱼桌宠初代_D-16A`](大肥鱼桌宠初代_D-16A) | 存档 | 初版（8 个源文件与下方「原版」目录相同，另多一份 README） |
-| — | [`原版（Windows版）`](原版（Windows版）) | 原版存档 | 本项目的起点版本；已经过社区改进（见下文），但其中的 `DSH余额桌宠.zip` 仍为最初发布的压缩包 |
+| **v3** | [`大肥鱼桌宠改_D-16BVM`](windows) | **当前版本** | 表情差分 · 铁盆 · 多目标火控雷达 · PDF 说明书 |
+| v2 | [`大肥鱼桌宠改_D-16B`](https://github.com/vkmich16/vk-1/tree/windows-d16b/windows) | 保留 | 拖拽惯性 · DSH 风格菜单第二版 |
+| v1 | [`大肥鱼桌宠初代_D-16A`](https://github.com/vkmich16/vk-1/tree/windows-d16a/windows) | 存档 | 初版（8 个源文件与下方「原版」目录相同，另多一份 README） |
+| — | [`原版（Windows版）`](https://github.com/vkmich16/vk-1/tree/windows-original/windows) | 原版存档 | 本项目的起点版本；已经过社区改进（见下文），但其中的 `DSH余额桌宠.zip` 仍为最初发布的压缩包 |
 
 ### 旧版目录的社区修复
 
@@ -148,7 +148,7 @@ Windows 版与 macOS 版**互不依赖**，各自独立运行；都只访问 Dee
 
 ### 文档
 
-`大肥鱼桌宠改_D-16BVM/` 里有两份说明，**每份都有 PDF / TXT / Markdown 三种格式，内容一样**：
+`Windows/` 里有两份说明，**每份都有 PDF / TXT / Markdown 三种格式，内容一样**：
 
 | 文档 | 内容 | 建议 |
 | --- | --- | --- |
