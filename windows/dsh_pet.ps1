@@ -38,6 +38,7 @@ using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.Http;
+using System.Threading.Tasks;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -995,9 +996,19 @@ sealed class InputDialog : Form {
 public sealed class SoundPool {
     [DllImport("winmm.dll", CharSet = CharSet.Unicode)]
     static extern int mciSendStringW(string cmd, StringBuilder ret, int len, IntPtr hwnd);
+    // Every mciSendString is synchronous and goes down to the audio device, so the time spent
+    // here IS the frame cost the pet pays for a sound. Accumulated so the ledger can print it:
+    // the red flash stutter was measured by muting one cue, and this is how the fix is proven
+    // rather than felt.
+    public static double SendMs;
+    public static int SendCount;
+
     static string Send(string cmd) {
+        long t0 = Stopwatch.GetTimestamp();
         StringBuilder sb = new StringBuilder(256);
         mciSendStringW(cmd, sb, sb.Capacity, IntPtr.Zero);
+        SendMs += (Stopwatch.GetTimestamp() - t0) * 1000.0 / Stopwatch.Frequency;
+        SendCount++;
         return sb.ToString();
     }
 
@@ -1063,23 +1074,41 @@ public sealed class SoundPool {
     public int VolumePercent { get { return _volumePercent; } }
     int _volumePercent = 80;
 
-    // plays on a free alias and returns its index, or -1 when nothing played
-    public int Play() {        if (Failed) return -1;
+    int _rr;                         // round-robin cursor
+    bool _fromZeroLogged;            // the "play from 0" fallback happened at least once
+
+    // One MCI call per play, and returns the alias index (or -1 when nothing played).
+    //
+    // WHY IT IS THIS SHORT: the cue used to ask MCI for every slot's mode, then seek, then
+    // play - 3 to 6 synchronous calls, and a close+open (a fresh DirectShow graph) whenever the
+    // slots happened to all be busy. The head-pat/charge cue fires five times a second during a
+    // red flash, which is 15-30 device round trips a second, and the user measured the result:
+    // muting this one cue makes the whole desktop's mouse perfectly smooth, while every other
+    // animation (one sound per action) never stutters. So the cue path must not chat with the
+    // device. "play <alias> from 0" restarts an open alias in a single command; the slots are
+    // cycled so a later cue never cuts the one still audible (4 slots at 0.2 s of cadence covers
+    // 0.8 s of clip, well past the shipped hit.mp3).
+    public int Play() {
+        if (Failed) return -1;
         try {
-            for (int attempt = 0; attempt < 2; attempt++) {
-                for (int i = 0; i < _slots; i++) {
-                    if (!_open[i]) continue;
-                    if (Send("status " + _alias[i] + " mode").IndexOf("playing") >= 0) continue;
-                    Send("seek " + _alias[i] + " to start");
-                    Send("play " + _alias[i]);
-                    Plays++;
-                    return i;
+            for (int tries = 0; tries < _slots; tries++) {
+                int i = _rr;
+                _rr = (_rr + 1) % _slots;
+                if (!_open[i]) continue;
+                if (Send("play " + _alias[i] + " from 0").Length == 0) { Plays++; return i; }
+                // The alias is open but would not play (the device dropped it, or the clip
+                // reached its end and the driver wants it re-selected). Fall back to the full
+                // sequence ONCE, and only for this slot - and SAY SO, because a fallback that
+                // runs every time puts the 3-call sequence (and the stutter) straight back.
+                if (!_fromZeroLogged) {
+                    _fromZeroLogged = true;
+                    try {
+                        File.AppendAllText(_logPath, DateTime.Now.ToString("s") +
+                            " sound: play-from-0 rejected, falling back to seek+play\r\n");
+                    } catch { }
                 }
-                // every slot is busy: reopen the first so a burst still overlaps
-                if (attempt == 0) {
-                    Send("close " + _alias[0]);
-                    _open[0] = Send("open \"" + _path + "\" type mpegvideo alias " + _alias[0]).Length == 0;
-                }
+                Send("seek " + _alias[i] + " to start");
+                if (Send("play " + _alias[i]).Length == 0) { Plays++; return i; }
             }
         } catch (Exception ex) {
             Failed = true; Error = ex.Message;
@@ -4365,6 +4394,7 @@ public sealed class DshPet : Form {
     // those instead of memsetting the whole screen-sized canvas.
     readonly List<Rectangle> _paintRects = new List<Rectangle>();
     readonly List<Rectangle> _lastRects = new List<Rectangle>();
+    readonly List<Rectangle> _keepRects = new List<Rectangle>();   // still on the canvas, unchanged
     Rectangle _dirtyRect;            // canvas area that changed this frame (for the push)
     Rectangle _lastWidgetRect;       // where the widget was drawn last frame
     bool _widgetWasAnimating;        // so the frame an animation ends on still repaints
@@ -4665,6 +4695,14 @@ public sealed class DshPet : Form {
         _cm      = double.Parse(Get("DSHPET_CM", "8"), CultureInfo.InvariantCulture);
         _soundWanted = Get("DSHPET_SOUND", "1") != "0";
         _ulwBlt = Get("DSHPET_ULWBLT", "1") != "0";
+        // Composites every Nth frame. 1 restores the old one-per-frame behaviour, which
+        // is also the rollback if the throttled push ever looks wrong.
+        _pushEvery = int.Parse(Get("DSHPET_PUSH_EVERY", "2"));
+        if (_pushEvery < 1) _pushEvery = 1;
+        _perfLog = Get("DSHPET_PERFLOG", "0") == "1";
+        // The phase counters only accumulate while _perfPhases is on, so a logged run
+        // would otherwise report totals with no internal split.
+        if (_perfLog) _perfPhases = true;
         // DSHPET_VOLUME is GONE, and a saved `volume=` key in state.ini is ignored. There is no
         // master level to seed any more: each pool is created at ITS OWN cue's level below, and
         // ReadState/ApplyAllCueVolumes then applies whatever was stored.
@@ -6168,6 +6206,7 @@ public sealed class DshPet : Form {
         }
     }
     static bool DiagExpr = false;
+    static bool DiagErase = false;
     public void SetDiagExpr(bool on) { DiagExpr = on; }
 
     // The point on the girl the bowl's distance and altitude are measured against.
@@ -6188,23 +6227,60 @@ public sealed class DshPet : Form {
     // virtual screen so the rectangle stays within the canvas.
     Rectangle RadarBounds(Rice bowl) {
         RadarBlip b = bowl.Blp;
+        RadarBlip bl = bowl.Blp;
         double S = b.S;
         if (S <= 0) return Rectangle.Empty;
-        // Right edge: the distance / closure labels are left-aligned off the bracket and
-        // can run past the screen. Cap to the canvas rather than to the virtual screen:
-        // the labels are clipped by the canvas anyway, and using the screen width here
-        // produced boxes wider than the canvas (negative-width intersects downstream).
-        double right = _canvas != null ? _canvas.Width : SystemInformation.VirtualScreen.Right;
+        // Exact bounds. The box used to run to the right edge of the canvas because the
+        // distance / closure labels are left-aligned off the bracket: measured, that made
+        // every radar frame dirty the whole 2560x1600 canvas (fillPx=4096000) at
+        // render 12.45 ms + push 23.85 ms - a 36 ms frame. That is the radar stutter.
+        //
+        // Narrowing it by guessing "one S past the bracket" was ALSO wrong and left trails,
+        // because the labels are wider than that. So it is derived from the real label
+        // bitmaps and the ring instead - the same numbers DrawRadar uses.
+        //
+        // EnsureRadarText is keyed on the readout text, so this does not rebuild anything
+        // unless a number actually changed.
+        double typeH = Math.Max(11.0, 0.40 * S);
+        double numH  = Math.Max(11.0, 0.30 * S);
+        EnsureRadarText(bowl, (int)Math.Round(typeH), (int)Math.Round(numH));
+
+        double x0 = b.Cx - S / 2, y0 = b.Cy - S / 2, x1 = b.Cx + S / 2, y1 = b.Cy + S / 2;
+        double gapX = 0.08 * S;
         // 4 px of slack all round: the antialiased stroke draws slightly outside the
         // bracket, and a box that is too tight leaves a faint green rim behind.
-        double left = b.Cx - S / 2 - 0.20 * S - 4;
-        double top = b.Cy - S / 2 - 4;
-        double bottom = b.Cy + S / 2 + 1.10 * S + 4;
-        Rectangle r = Rectangle.FromLTRB(
+        double left = x0 - 4;
+        double top = y0 - 4;
+        double right = x1 + 4;
+        double bottom = y1 + 4;
+        if (bl.TypeBmp != null) {
+            double l = b.Cx - bl.TypeBmp.Width / 2.0;
+            double r2 = b.Cx + bl.TypeBmp.Width / 2.0;
+            double t = y0 - bl.TypeBmp.Height - 0.06 * S;
+            if (l < left) left = l;
+            if (r2 > right) right = r2;
+            if (t < top) top = t;
+        }
+        if (bl.DistBmp != null) {
+            double r2 = x1 + gapX + bl.DistBmp.Width;
+            if (r2 > right) right = r2;
+        }
+        if (bl.ClosureBmp != null) {
+            double r2 = x1 + gapX + bl.ClosureBmp.Width;
+            if (r2 > right) right = r2;
+        }
+        if (bl.AltBmp != null) {
+            double r2 = x1 + 0.11 * S;
+            double bo = y1 + 0.09 * S + bl.AltBmp.Height;
+            if (r2 > right) right = r2;
+            if (bo > bottom) bottom = bo;
+        }
+        // Direction ring and its pointer hang below the bracket.
+        double ringReach = 0.70 * S + 0.185 * S + 0.15 * S;
+        if (y1 + ringReach > bottom) bottom = y1 + ringReach;
+        return Rectangle.FromLTRB(
             (int)Math.Floor(left), (int)Math.Floor(top),
-            (int)Math.Ceiling(right), (int)Math.Ceiling(bottom));
-        // Pad the top for the type label, which is drawn above the bracket.
-        return new Rectangle(r.X, r.Y - (int)Math.Ceiling(0.60 * S), r.Width, r.Height + (int)Math.Ceiling(0.60 * S));
+            (int)Math.Ceiling(right + 4), (int)Math.Ceiling(bottom + 4));
     }
 
     // Fill the nameplate readouts from the live bowl. Shared by the automatic lock and
@@ -6716,11 +6792,24 @@ public sealed class DshPet : Form {
         SyncWindowModeInternal();
         _scale = (double)_h / _flat.Height;
 
+        // Close the Relayout timer here: everything above (including the expression
+        // resample) has run, and the rest of the method is cheap coordinate work.
+        if (_perfLog && _plRelayoutDepth != 0) {
+            double one = Ms(_plRelayoutT0);
+            _plRelayoutMs += one;
+            if (one > _plRelayoutMax) _plRelayoutMax = one;
+            _plRelayoutDepth = 0;
+        }
         int eidx = (_exprArt != null) ? Array.IndexOf(_exprArt, _flat) : -1;
         // A cached entry is complete (sprite AND overlay) and matches the current size, so
         // this mood needs no resample and no overlay rebuild. The rest of this method still
         // runs: _fx/_fy/_headX and the sprite quad are cheap and must stay in step.
         bool exprCached = eidx >= 0 && _exprSprCache[eidx] != null && _exprRedCache[eidx] != null;
+        if (_perfLog) {
+            _plRelayout++;
+            if (exprCached) _plExprHit++; else _plExprMiss++;
+            if (_plRelayoutDepth == 0) { _plRelayoutDepth = 1; _plRelayoutT0 = Stopwatch.GetTimestamp(); }
+        }
         int sw = 0, sh = 0;
         Bitmap scaled = null;
         if (!exprCached) {
@@ -6759,7 +6848,16 @@ public sealed class DshPet : Form {
                 if (IsDead(_exprRedCache[i])) _exprRedCache[i] = null;
             }
         }
-        if (_canvas != null) _canvas.Dispose();
+        // Only throw the canvas away when its SIZE changes. Disposing it costs a fresh
+        // `new Bitmap(_winW, _winH)` below - 16 MB for a 2560x1600 screen - and that
+        // allocation was showing up as a 65 ms frame (a tick_avg of 8 ms hid it).
+        // A mood change does not resize the canvas, so reuse it: _lastCanvas is nulled
+        // just below, which forces a full repaint and leaves nothing stale behind.
+        bool canvasResize = _canvas == null || _canvasW != _winW || _canvasH != _winH;
+        if (canvasResize) {
+            if (_perfLog) _plCanvasRebuilt++;
+            if (_canvas != null) _canvas.Dispose();
+        }
         // The panel cache is keyed on the widget size and on _fx, both of which change
         // here, so it would miss anyway - dropping it just frees the memory sooner.
         if (_panelCache != null) { _panelCache.Dispose(); _panelCache = null; }
@@ -6782,7 +6880,10 @@ public sealed class DshPet : Form {
         }
         // The canvas must match the WINDOW, not the widget: while a bowl is out the
         // window covers the screen and the widget is blitted in at _offX/_offY.
-        _canvas = new Bitmap(_winW, _winH, PixelFormat.Format32bppArgb);
+        if (canvasResize || _canvas == null) {
+            _canvas = new Bitmap(_winW, _winH, PixelFormat.Format32bppArgb);
+            _canvasW = _winW; _canvasH = _winH;
+        }
 
         // tablet screen quad in sprite pixels, from make_sprite.ps1 (min-area
         // rotated rectangle around the opaque black screen).
@@ -8468,6 +8569,40 @@ public sealed class DshPet : Form {
     int _memW, _memH;
     byte[] _rowScratch;
     bool _forceFullFill;
+    // ---- push throttle (optimisation 2) -------------------------------------
+    // UpdateLayeredWindow composites the ENTIRE layered window, so a frame whose
+    // dirty rectangle is 10x10 px costs the same as a full repaint: measured 11.6 ms
+    // of push against 1.35 ms of render. The canvas therefore keeps rendering at
+    // 60 fps and only the composite is held back - at these speeds the difference is
+    // not visible, while the frame cost drops by about half.
+    //
+    // A frame that skips the composite hands its dirty rectangle to _deferRect, which
+    // the next composite folds in, so nothing is ever left un-pushed.
+    // ---- runtime frame ledger (DSHPET_PERFLOG=1) ----------------------------
+    // --perf runs with the window hidden, so its numbers are not the shipped cost.
+    // This accumulates the real ones and writes them to pet.log once a second.
+    bool _perfLog;
+    double _plTick, _plRender, _plPush, _plLast;
+    double _plFillPx, _plFillMs;      // pixels converted + ms spent inside FillDib
+    int _plMaxRw, _plMaxRh;           // widest / tallest dirty rectangle this second
+    int _plFullFills;                 // how many pushes took the whole-canvas path
+    int _plDibOk, _plHbitmap;         // which push path ran, and how often
+    int _canvasW, _canvasH;           // size of the live canvas bitmap
+    int _plCanvasRebuilt;             // how often Relayout really reallocated it
+    int _plRelayout, _plExprHit, _plExprMiss;
+    double _plTickMax, _plRenderMax, _plPushMax;
+    long _plMarkBig;                  // largest MarkDirty area this second
+    int _plMarkW, _plMarkH, _plMarkX, _plMarkY;
+    double _plRelayoutMs;
+    int _plRelayoutDepth;             // guards the timer against re-entry
+    long _plRelayoutT0;               // start stamp for the Relayout timer
+    double _plRelayoutMax;            // slowest single Relayout this second
+    double _plHbitmapMs;              // time inside the HBITMAP rebuild path
+    int _plFrames, _plPushes;
+    int _pushEvery = 2;              // 1 = composite every frame (the old behaviour)
+    double _lastPushSec = -1.0;
+    Rectangle _deferRect;            // dirty area carried over from a skipped push
+    long _pushSkip;                  // how many composites were deferred (diagnostics)
     void EnsureMemSurface(int w, int h) {
         if (_memBmp != IntPtr.Zero && _memW == w && _memH == h) return;
         ReleaseMemSurface();
@@ -8502,9 +8637,17 @@ public sealed class DshPet : Form {
     // comes back from it as [128,0,0,128] - but it does it by building a brand new
     // 16 MB HBITMAP on every frame, which was 6 ms of the frame budget.
     void FillDib(Rectangle r) {
+        long tFill = _perfLog ? Stopwatch.GetTimestamp() : 0;
         r = Rectangle.Intersect(r, CanvasRect());
         int rw = r.Width, rh = r.Height;
         if (rw <= 0 || rh <= 0) return;
+        if (_perfLog) {
+            _plFillPx += (double)rw * rh;
+            _plFillMs += Ms(tFill);
+            if (rw > _plMaxRw) _plMaxRw = rw;
+            if (rh > _plMaxRh) _plMaxRh = rh;
+            if (rw >= _canvas.Width && rh >= _canvas.Height) _plFullFills++;
+        }
         if (_rowScratch == null || _rowScratch.Length < rw * 4) _rowScratch = new byte[rw * 4];
         Buf cb = new Buf(_canvas, r);
         try {
@@ -8553,13 +8696,48 @@ public sealed class DshPet : Form {
         try { PushLayerInner(); } finally { LastPushMs = Ms(tPush); }
     }
 
+    // Remember this frame's dirty rectangle so a deferred frame is not lost.
+    void AccumulateDeferredPush() {
+        if (_forceFullFill || _dirtyRect.IsEmpty) return;
+        _deferRect = _deferRect.IsEmpty ? _dirtyRect : Rectangle.Union(_deferRect, _dirtyRect);
+    }
+
+    // Composite now, or wait for the next frame?
+    bool PushDue() {
+        if (_pushEvery <= 1) return true;
+        double now = NowSec();
+        if (_lastPushSec < 0.0 ||
+            (now - _lastPushSec) * 1000.0 >= _pushEvery * _timer.Interval) {
+            _lastPushSec = now;
+            _pushSkip = 0;
+            return true;
+        }
+        _pushSkip++;
+        return false;
+    }
+
+    // Take the carried-over rectangle and clear it, so it is pushed exactly once.
+    Rectangle TakeDeferredPush() {
+        Rectangle r = _deferRect;
+        _deferRect = Rectangle.Empty;
+        return r;
+    }
+
     void PushLayerInner() {
         Rectangle dr = _dirtyRect;
-        bool haveDirty = _forceFullFill || (!dr.IsEmpty && dr.Width > 0 && dr.Height > 0);
+        // _deferRect counts as work. Without it, a push that was throttled on a ONE-SHOT change
+        // (a size change, a menu toggle) is parked until some unrelated frame sets _dirty again -
+        // the screen keeps the previous pixels in the meantime, which is the "old bigger outline
+        // stays behind after shrinking her" report.
+        bool haveDirty = _forceFullFill || !_deferRect.IsEmpty ||
+                         (!dr.IsEmpty && dr.Width > 0 && dr.Height > 0);
         // Nothing changed, so the screen already shows it: the caller re-renders on
         // every animation frame, and a frame that repainted nothing does not need a
         // 16 MB composite.
         if (!haveDirty) return;
+        if (!PushDue()) { AccumulateDeferredPush(); return; }
+        dr = _forceFullFill ? CanvasRect()
+                            : (dr.IsEmpty ? TakeDeferredPush() : Rectangle.Union(dr, TakeDeferredPush()));
         _pushCount++;                 // a real push to the screen, for the liveness guard
         if (_ulwBlt) {
             EnsureMemSurface(_canvas.Width, _canvas.Height);
@@ -8573,8 +8751,9 @@ public sealed class DshPet : Form {
                 // ignored: the call still composites the entire window, so a DIB that
                 // was only partly refreshed came back as ghosting of whatever used to
                 // be in the untouched part. `--ulwcheck` is what caught that.
-                FillDib(_forceFullFill ? CanvasRect() : dr);
+                FillDib(dr);
                 _forceFullFill = false;
+                if (_perfLog) _plDibOk++;
                 if (PushViaDib()) return;
             }
             _ulwBlt = false;                        // DIB route unusable: use the old one
@@ -8603,6 +8782,13 @@ public sealed class DshPet : Form {
     // The original path, kept as the fallback: build an HBITMAP for the whole canvas
     // and let UpdateLayeredWindow recomposite all of it.
     void PushViaHBitmap() {
+        long tHb = _perfLog ? Stopwatch.GetTimestamp() : 0;
+        if (_perfLog) _plHbitmap++;
+        try { PushViaHBitmapInner(); }
+        finally { if (_perfLog) _plHbitmapMs += Ms(tHb); }
+    }
+
+    void PushViaHBitmapInner() {
         IntPtr screenDc = Native.GetDC(IntPtr.Zero);
         IntPtr memDc = Native.CreateCompatibleDC(screenDc);
         IntPtr hBmp = IntPtr.Zero, old = IntPtr.Zero;
@@ -8683,6 +8869,7 @@ public sealed class DshPet : Form {
     // looks exactly like a working one from the outside - which is how the hit-test version
     // shipped broken.
     int _hookFired, _hookInstalled;
+    int _hookLeakFixed;              // logged once when the sweep above had to clean up
 
     void InstallMenuClickHook() {
         if (_mouseHook != IntPtr.Zero) return;
@@ -8741,6 +8928,18 @@ public sealed class DshPet : Form {
     // Called from the tick. Kept separate from the hook callback because this is where touching
     // the control is safe, and because the decision and the action are easier to test apart.
     void ApplyPendingMenuClose() {
+        // Belt and braces for the leak above: a WH_MOUSE_LL hook serialises the ENTIRE machine's
+        // mouse input through this thread, so it must never outlive the menu that needs it. If no
+        // menu is up and the hook is still installed - from any path, present or future - drop it
+        // here, once per tick, rather than trusting every close route to remember.
+        if (_mouseHook != IntPtr.Zero && (_menu == null || !_menu.Visible) && !CrumbOpenUi) {
+            RemoveMenuClickHook();
+            if (_hookLeakFixed == 0) {
+                _hookLeakFixed = 1;
+                Log("menu click hook released with no menu open (a global mouse hook left installed" +
+                    " makes every mouse move on the machine wait for this thread)");
+            }
+        }
         if (!_menuClickPending) return;
         _menuClickPending = false;
         if (_menu != null && _menu.Visible) _menu.Close();
@@ -8877,9 +9076,16 @@ public sealed class DshPet : Form {
             // pop the menu; the request is explicitly "right-click the girl only".
             if (GirlPixelSolid(e.X, e.Y)) {
                 RefreshMenuChecks();
-                ArmMenuClickHook();
-                // The breadcrumb panel replaces the cascade. _menu is still built and still checked
-                // by --menucheck; showing it is what changed, so reverting is this one call.
+                // NO ArmMenuClickHook() HERE. The hook exists to dismiss _menu when the user
+                // clicks somewhere else, and its callback returns immediately unless
+                // _menu.Visible - which is never true on this path, because the breadcrumb
+                // panel is what gets shown. Its only uninstall point is _menu.Closed, which
+                // cannot fire for a menu that was never opened, so arming it here left a
+                // WH_MOUSE_LL hook installed for the rest of the session. That hook makes
+                // Windows dispatch every mouse event on the machine through this UI thread,
+                // which is exactly the reported "the mouse stutters while the red flash plays" -
+                // it appeared only after a right-click and only while frames were expensive.
+                // The panel closes itself: CrumbPanel.Deactivate -> Close.
                 ShowCrumbUi(Cursor.Position);
             }
         }
@@ -9092,9 +9298,20 @@ public sealed class DshPet : Form {
         // screen while ticks and pushes carry on as normal - the same class of bug the comment above
         // records for the flinch. Deliberately not _peakMode: that would repaint the whole widget on
         // every frame while the panel is up.
+        // The radar is up but NOTHING about her is changing: no hit, no floating
+        // number, no heart, no squash, no hand, no top-up landing on her. In that case
+        // her own box must stay OUT of the dirty rectangle - measured, including it
+        // turned a 542x586 radar box into a 1626x1410 dirty rect (2.9 M px per frame,
+        // render 12 ms + push 24 ms) because the two boxes Union.
+        // A bowl that overlaps her still forces a repaint below, through the
+        // _lastRects scan, so the "the bowl smears her away" fix is untouched.
+        bool radarOnly = (_blipWasOn || _radarRects.Count > 0)
+                          && _hits.Count == 0 && _floaters.Count == 0 && _hearts.Count == 0
+                          && !_snapping && _headSquashT >= HeadSquashDur
+                          && !_patActive && !_patWasActive && !_forceFullFill;
         bool widgetAnimating = _forceFullFill ||
                                _hits.Count > 0 || _floaters.Count > 0 || _hearts.Count > 0 || _snapping
-                               || _blipWasOn || _radarRects.Count > 0
+                               || (_blipWasOn || _radarRects.Count > 0)
                                || _headSquashT < HeadSquashDur
                                // The pat redraws the hand every frame, and the hand is part of the
                                // widget's own paint, so without this the pat would compute its frame
@@ -9102,10 +9319,28 @@ public sealed class DshPet : Form {
                                // while every coordinate looked right: the numbers cannot tell you that
                                // a method was never called.
                                || _patActive || _patWasActive;
-        bool repaintWidget = widgetAnimating || _widgetWasAnimating
+        // With the radar as the only animation, and her box and the panel unchanged,
+        // there is nothing of hers to redraw; forcing it is what made the radar frames
+        // expensive. Any change to her box, the canvas or the panel still wins.
+        // PanelKey() is deliberately NOT part of this test. It carries the radar readouts
+        // (DistText / ClosureText / AltText), which change every frame while the radar
+        // tracks a bowl - so testing it here forced a repaint of HER on every radar frame.
+        // That is what welded her 454x624 box to the radar's 542x586 box and produced a
+        // 1626x1410 dirty rectangle.
+        //
+        // Nothing is lost: the radar labels are drawn straight onto the canvas by
+        // DrawRadar and MarkDirty'd there, and the tablet digits are drawn by DrawScreen.
+        // Neither needs PaintWidgetArt. The animation flags below still force a repaint
+        // whenever anything of hers actually moves.
+        bool repaintWidget;
+        if (radarOnly && _canvas == _lastCanvas && widgetRect == _lastWidgetRect) {
+            repaintWidget = false;
+        } else {
+            repaintWidget = widgetAnimating || _widgetWasAnimating
                              || _canvas != _lastCanvas
                              || widgetRect != _lastWidgetRect
                              || PanelKey() != _lastPanelKey;
+        }
         // A bowl that overlaps the girl forces a repaint too: erasing the rectangle the
         // bowl used to occupy also erases whatever of HER was underneath it, and if the
         // widget is not repainted afterwards that bite stays missing - the bowl smears
@@ -9137,8 +9372,18 @@ public sealed class DshPet : Form {
         // END of the frame: swapping the lists here, before this frame's rects are
         // known, left a moved bowl's old position unerased for one frame - and then
         // forgotten, so the ghost stayed on screen for good.
+        if (DiagErase) {
+            Log("ERASE frame: repaintWidget=" + repaintWidget + " lastRects=" + _lastRects.Count +
+                " artClear=" + _lastArtClear + " widgetRect=" + widgetRect +
+                " size=" + _w + " off=" + _offX + "," + _offY);
+        }
         for (int i = 0; i < _lastRects.Count; i++) {
             Rectangle r = _lastRects[i];
+            if (DiagErase) {
+                Log("  ERASE rect " + i + "=" + r +
+                    " skipArt=" + (repaintWidget && _lastArtClear.Contains(r)) +
+                    " skipSame=" + (!repaintWidget && r == widgetRect));
+            }
             // "Repainted below" only covers what PaintWidgetArt actually CLEARS - skippable
             // here only if the widget repaint really rewrites those pixels.
             //
@@ -9148,7 +9393,10 @@ public sealed class DshPet : Form {
             // margin was skipped here AND never cleared there - the ghost a dragged bowl left
             // behind above her art. --bowlgirl is the regression for that.
             if (repaintWidget && _lastArtClear.Contains(r)) continue;
-            if (!repaintWidget && r == widgetRect) continue;         // unchanged: keep it
+            // Unchanged, so it stays on the canvas - and the NEXT frame has to be told about it.
+            // Dropping it here is what let a size change erase nothing: by the time the size
+            // changed, several idle frames had already replaced the record with an empty list.
+            if (!repaintWidget && r == widgetRect) { _keepRects.Add(r); continue; }
             if (_potTrace && PotTraceFrames < PotTraceMaxFrames) {
                 PotTraceLog.Add("  clear   : rect=" + r.X + "," + r.Y + " " + r.Width + "x" + r.Height);
             }
@@ -9156,7 +9404,14 @@ public sealed class DshPet : Form {
             MarkDirty(r);
         }
         _paintRects.Clear();
-        _paintRects.Add(widgetRect);       // the canvas holds content here from now on
+        // Re-admitted AFTER the clear: a rectangle that was skipped above is still on the canvas,
+        // so the next frame must still be told about it. (Adding it before the clear is what made
+        // the first attempt a no-op.)
+        if (_keepRects.Count > 0) { _paintRects.AddRange(_keepRects); _keepRects.Clear(); }
+        // Only claim her box when it is actually (re)painted this frame. Adding it
+        // unconditionally made the next frame MarkDirty a full-height strip even though
+        // nothing of hers had been drawn - the other half of the radar cost.
+        if (repaintWidget) _paintRects.Add(widgetRect);
         _lastWidgetRect = widgetRect;
         _lastCanvas = _canvas;
         _lastPanelKey = PanelKey();
@@ -9551,6 +9806,11 @@ public sealed class DshPet : Form {
         BuildHitMap(ox + _offX, oy + _offY);
         if (_perfPhases) { _phHit += Ms(t0); }
         // Hand this frame's boxes to the next frame, which erases them.
+        if (DiagErase) {
+            Log("BOOK paintRects=" + _paintRects.Count + " repaintWidget=" + _lastRepaintWidget +
+                " widget=" + widgetRect + " size=" + _w + " off=" + _offX + "," + _offY +
+                " defer=" + _deferRect);
+        }
         _lastRects.Clear();
         _lastRects.AddRange(_paintRects);
         _dirty = false;
@@ -9790,6 +10050,14 @@ public sealed class DshPet : Form {
     // the canvas here: during startup the widget rect can sit at a negative y
     // (the corner is not known yet) and LockBits rejects an out-of-range rect.
     void MarkDirty(Rectangle r) {
+        if (_perfLog) {
+            long a = (long)r.Width * r.Height;
+            if (a > _plMarkBig) {
+                _plMarkBig = a;
+                _plMarkW = r.Width; _plMarkH = r.Height;
+                _plMarkX = r.X; _plMarkY = r.Y;
+            }
+        }
         Rectangle c = Rectangle.Intersect(r, CanvasRect());
         if (c.Width <= 0 || c.Height <= 0) return;
         _dirtyRect = _dirtyRect.IsEmpty ? c : Rectangle.Union(_dirtyRect, c);
@@ -9831,6 +10099,9 @@ public sealed class DshPet : Form {
     // Tick-side phases: the landing stutter has to be attributable to physics, mood,
     // radar or the draw, and only measurement can say which.
     double _phRicePhys, _phExpr, _phRadar, _phTickTail;
+    double _phHoliday;              // the once-a-day holiday hook, timed so it can be proved cheap
+    double _phPat;                  // the pat state machine (never timed before)
+    double _phPollDrain;            // PollNow + the cue drain
     double _phPoll, _phDrain;
     // Slowest-frame capture. A frame that runs 15x over budget does not show up in an
     // average, and "which stage owned that frame" is the only question worth asking of
@@ -9849,9 +10120,13 @@ public sealed class DshPet : Form {
         _phArtGfx = _phArtClear = _phArtGirl = _phArtRed = 0;
         _phBufCtor = _phUnlock = 0;
         _phRicePhys = _phExpr = _phRadar = _phTickTail = 0;
+        _phHoliday = 0; _phPat = 0; _phPollDrain = 0;
         _phPoll = _phDrain = 0;
     }
     string PhaseReport(int n) {
+        // Guarded: the per-second ledger can ask for a report in a tick where no frame
+        // accumulated yet, and 0.0/0 prints as NaN (or Infinity for a non-zero numerator).
+        if (n < 1) n = 1;
         return "  render phases   : sprite+clear " + (_phSprite / n).ToString("0.00") +
                "  screen " + (_phScreen / n).ToString("0.00") +
                "  snapshot " + (_phSnap / n).ToString("0.00") +
@@ -9878,7 +10153,10 @@ public sealed class DshPet : Form {
                "  rice " + (_phRicePhys / n).ToString("0.00") +
                "  expr " + (_phExpr / n).ToString("0.00") +
                "  radar " + (_phRadar / n).ToString("0.00") +
-               "  tail " + (_phTickTail / n).ToString("0.00") + " ms";
+               "  tail " + (_phTickTail / n).ToString("0.00") +
+                "  holiday " + (_phHoliday / n).ToString("0.00") +
+                "  polldrain " + (_phPollDrain / n).ToString("0.00") +
+                "  pat " + (_phPat / n).ToString("0.00") + " ms";
     }
 
     // src over dst, clipped to the locked rectangle of dst. ox/oy are CANVAS
@@ -10075,31 +10353,266 @@ public sealed class DshPet : Form {
     // conversion is fixed at +8 rather than taken from the machine's zone.
     DateTime CloudBeijing() { return CloudNow().AddHours(8); }
 
-    // Off-peak is 00:30-08:30 Beijing, per the published pricing page. The holiday rule (statutory
-    // holidays and swapped working weekends are off-peak all day) needs a calendar we do not ship,
-    // so it is deliberately not guessed at here.
-    // Time until the tariff flips, and which way. Off-peak runs 00:30-08:30 Beijing, so from
-    // off-peak the next change is 08:30, and from peak it is the next 00:30 (today if we are still
-    // before it, otherwise tomorrow's).
-    TimeSpan UntilSwitch(out bool toPeak) {
-        DateTime bj = CloudBeijing();
-        int m = bj.Hour * 60 + bj.Minute;
-        bool off = m >= 30 && m < 510;
-        toPeak = off;                       // leaving off-peak means heading INTO peak
-        int target;
-        if (off) target = 510;              // 08:30
-        else if (m < 30) target = 30;       // 00:00-00:29 -> 00:30 today
-        else target = 24 * 60 + 30;         // after 08:30 -> 00:30 tomorrow
-        int diffMin = target - m;
-        int secs = diffMin * 60 - bj.Second;
-        if (secs < 0) secs = 0;
-        return TimeSpan.FromSeconds(secs);
+    // Peak / off-peak, per the published pricing page:
+    //   "Beijing time, Monday to Friday (excluding Chinese statutory holidays):
+    //    09:00-12:00 and 14:00-18:00 are peak; all other periods, including
+    //    weekends and statutory holidays the whole day, are off-peak."
+    // Off-peak costs half of peak.
+    //
+    // This replaced the older overnight model (00:30-08:30 off-peak). Under the
+    // current rule a weekday has exactly four switch points - 09:00, 12:00,
+    // 14:00 and 18:00 - while a weekend has none, so the countdown below has to
+    // scan forward for the next switch instead of naming a fixed one.
+    //
+    // Statutory holidays are deliberately NOT handled: the rule needs a calendar
+    // and a swapped-working-weekend table that this program does not ship, and a
+    // wrong guess would be worse than the plain weekday rule. So a holiday
+    // weekday reads as peak during 09:00-12:00 and 14:00-18:00.
+    static bool IsPeakAt(DateTime bj) {
+        // A statutory holiday is off-peak the whole day, weekday or not.
+        if (IsHoliday(bj)) return false;
+        DayOfWeek d = bj.DayOfWeek;
+        if (d == DayOfWeek.Saturday || d == DayOfWeek.Sunday) return false;
+        double h = bj.Hour + bj.Minute / 60.0;
+        return (h >= 9.0 && h < 12.0) || (h >= 14.0 && h < 18.0);
     }
 
-    bool OffPeakNow() {
+    // ---- statutory holidays -------------------------------------------------
+    // The pricing page: peak is "Mon-Fri (EXCLUDING Chinese statutory holidays)
+    // 09:00-12:00 and 14:00-18:00"; everything else is off-peak. A holiday is
+    // therefore off-peak for the whole day even on a weekday. That is the only
+    // part of the rule that cannot be computed - it needs the State Council's
+    // annual announcement - so it lives in a table.
+    //
+    // The year is refreshed over the network once a day: the pet already talks
+    // to the network for the balance, so this is not a new dependency. If every
+    // source fails the last cached table is used, then the built-in one, then
+    // the plain weekday rule - a readable weekday degrades in precision, never
+    // into a wrong answer.
+    static readonly object HolidayLock = new object();
+    static System.Collections.Hashtable _holidayDates = new System.Collections.Hashtable();
+    static string _holidayYear = "";
+    static DateTime _holidayDayChecked = DateTime.MinValue;
+    static DateTime _holidayLastTry = DateTime.MinValue;
+    const int HolidayRefreshHours = 24;     // re-check daily so a new year lands by itself
+
+    // Authoritative data, embedded so the rule is correct with no network at all.
+    // 2018-2026 from the holiday-cn dataset (converted from the State Council
+    // announcements). Add a year here when one is published.
+    static readonly string[] HolidayBuiltIn = new string[] {
+        "20180101","20180215","20180216","20180217","20180218","20180219","20180220","20180221",
+        "20180405","20180406","20180407","20180429","20180430","20180501","20180618",
+        "20180924","20181001","20181002","20181003","20181004","20181005","20181006","20181007",
+        "20190101","20190204","20190205","20190206","20190207","20190208","20190209","20190210",
+        "20190405","20190406","20190407","20190501","20190502","20190503","20190504",
+        "20190607","20190608","20190609","20190913","20190914","20190915",
+        "20191001","20191002","20191003","20191004","20191005","20191006","20191007",
+        "20200101","20200124","20200125","20200126","20200127","20200128","20200129","20200130",
+        "20200404","20200405","20200406","20200501","20200502","20200503","20200504","20200505",
+        "20200625","20200626","20200627","20201001","20201002","20201003","20201004","20201005",
+        "20201006","20201007","20201008",
+        "20210101","20210102","20210103","20210211","20210212","20210213","20210214","20210215",
+        "20210216","20210217","20210403","20210404","20210405","20210501","20210502","20210503",
+        "20210504","20210505","20210612","20210613","20210614","20210919","20210920","20210921",
+        "20211001","20211002","20211003","20211004","20211005","20211006","20211007",
+        "20220101","20220102","20220103","20220131","20220201","20220202","20220203","20220204",
+        "20220205","20220206","20220403","20220404","20220405","20220430","20220501","20220502",
+        "20220503","20220504","20220603","20220604","20220605","20220910","20220911","20220912",
+        "20221001","20221002","20221003","20221004","20221005","20221006","20221007",
+        "20230101","20230102","20230121","20230122","20230123","20230124","20230125","20230126",
+        "20230127","20230405","20230429","20230430","20230501","20230502","20230503",
+        "20230622","20230623","20230624","20230929","20230930",
+        "20231001","20231002","20231003","20231004","20231005","20231006",
+        "20240101","20240210","20240211","20240212","20240213","20240214","20240215","20240216",
+        "20240217","20240404","20240405","20240406","20240501","20240502","20240503","20240504",
+        "20240505","20240608","20240609","20240610","20240915","20240916","20240917",
+        "20241001","20241002","20241003","20241004","20241005","20241006","20241007",
+        "20250101","20250128","20250129","20250130","20250131","20250201","20250202","20250203",
+        "20250204","20250404","20250405","20250406","20250501","20250502","20250503","20250504",
+        "20250505","20250531","20250601","20250602","20251001","20251002","20251003","20251004",
+        "20251005","20251006","20251007","20251008",
+        "20260101","20260102","20260103","20260215","20260216","20260217","20260218","20260219",
+        "20260220","20260221","20260222","20260223","20260404","20260405","20260406",
+        "20260501","20260502","20260503","20260504","20260505","20260619","20260620","20260621",
+        "20260925","20260926","20260927","20261001","20261002","20261003","20261004","20261005",
+        "20261006","20261007"
+    };
+
+    static string HolidayCachePath() {
+        return Path.Combine(AppBaseDir, "holidays.json");
+    }
+
+    // One parser serves both the network response and the cached file, because
+    // the cache stores the source document verbatim.
+    static bool TryParseHolidayJson(string json, string year, out string[] dates, out int count) {
+        dates = new string[0]; count = 0;
+        if (json == null || json.IndexOf("days") < 0) return false;
+        System.Collections.ArrayList list = new System.Collections.ArrayList();
+        int pos = 0;
+        while (true) {
+            int d = json.IndexOf("date", pos);
+            if (d < 0) break;
+            int q1 = json.IndexOf('"', d + 4);
+            if (q1 < 0) break;
+            int q2 = json.IndexOf('"', q1 + 1);
+            if (q2 < 0) break;
+            string v = json.Substring(q1 + 1, q2 - q1 - 1);
+            pos = q2 + 1;
+            if (v.Length != 10 || v[4] != '-') continue;
+            int off = json.IndexOf("isOffDay", q2);
+            if (off < 0) break;
+            int t = json.IndexOf("true", off);
+            if (t < 0 || t - off > 24) continue;          // false, or malformed
+            list.Add(v.Substring(0, 4) + v.Substring(5, 2) + v.Substring(8, 2));
+        }
+        if (list.Count == 0) return false;
+        dates = (string[])list.ToArray(typeof(string));
+        count = dates.Length;
+        return true;
+    }
+
+    static void StoreHolidayDates(string[] dates, string year) {
+        System.Collections.Hashtable h = new System.Collections.Hashtable();
+        for (int i = 0; i < dates.Length; i++) { h[dates[i]] = true; }
+        lock (HolidayLock) { _holidayDates = h; _holidayYear = year; }
+    }
+
+    static void ClearHolidayTable() {
+        lock (HolidayLock) {
+            _holidayDates = new System.Collections.Hashtable();
+            _holidayYear = "";
+        }
+    }
+
+    static void LoadHolidayBuiltIn(string year) {
+        System.Collections.ArrayList list = new System.Collections.ArrayList();
+        for (int i = 0; i < HolidayBuiltIn.Length; i++) {
+            if (HolidayBuiltIn[i].StartsWith(year)) list.Add(HolidayBuiltIn[i]);
+        }
+        if (list.Count > 0) {
+            StoreHolidayDates((string[])list.ToArray(typeof(string)), year);
+        } else {
+            // No table for this year (e.g. the clock rolled into a year whose
+            // announcement is not out yet). Keeping the PREVIOUS year's table
+            // would leave _holidayYear on the old value and answer from a stale
+            // calendar, so clear it and let the weekday rule apply.
+            ClearHolidayTable();
+        }
+    }
+
+    static void LoadHolidayCache() {
+        try {
+            string p = HolidayCachePath();
+            if (!File.Exists(p)) return;
+            string s = File.ReadAllText(p);
+            int i = s.IndexOf("year");
+            string y = "";
+            if (i >= 0) {
+                int colon = s.IndexOf(':', i);
+                if (colon > 0) {
+                    int e = colon + 1;
+                    while (e < s.Length && (s[e] == ' ' || s[e] == (char)9)) e++;
+                    int b = e;
+                    while (b < s.Length && s[b] >= '0' && s[b] <= '9') b++;
+                    if (b - e == 4) y = s.Substring(e, 4);
+                }
+            }
+            string[] dates; int n;
+            if (y.Length == 4 && TryParseHolidayJson(s, y, out dates, out n)) {
+                StoreHolidayDates(dates, y);
+                LogHoliday("holidays: " + n + " days for " + y + " from cache");
+            }
+        } catch { }
+    }
+
+    static string FetchHolidayJson(string year, int timeoutMs) {
+        string[] urls = new string[] {
+            "https://raw.githubusercontent.com/NateScarlet/holiday-cn/master/" + year + ".json",
+            "https://timor.tech/api/holiday/year/" + year
+        };
+        for (int i = 0; i < urls.Length; i++) {
+            try {
+                using (HttpClient c = new HttpClient()) {
+                    c.Timeout = TimeSpan.FromMilliseconds(timeoutMs);
+                    c.DefaultRequestHeaders.Add("User-Agent", "dsh-pet");
+                    string body = c.GetStringAsync(urls[i]).Result;
+                    if (body != null && body.Length > 40) return body;
+                }
+            } catch { }
+        }
+        return null;
+    }
+
+    static void RefreshHolidaysOnce(string year) {
+        string json = FetchHolidayJson(year, 10000);
+        if (json == null) {
+            LogHoliday("holidays: no source reachable for " + year + " - keeping current table");
+            return;
+        }
+        string[] dates; int n;
+        if (!TryParseHolidayJson(json, year, out dates, out n)) {
+            LogHoliday("holidays: " + year + " has no published days yet - weekday rule applies");
+            return;
+        }
+        StoreHolidayDates(dates, year);
+        try { File.WriteAllText(HolidayCachePath(), json); } catch { }
+        LogHoliday("holidays: " + n + " days for " + year + " (network)");
+    }
+
+    // Called every tick; the body runs once a day.
+    void MaybeRefreshHolidays() {
         DateTime bj = CloudBeijing();
-        int m = bj.Hour * 60 + bj.Minute;
-        return m >= 30 && m < 510;          // 00:30 .. 08:29
+        if (bj.Date == _holidayDayChecked) return;
+        _holidayDayChecked = bj.Date;
+        string year = bj.Year.ToString("0000");
+        LoadHolidayBuiltIn(year);
+        LoadHolidayCache();
+        if ((bj - _holidayLastTry).TotalHours >= HolidayRefreshHours) {
+            _holidayLastTry = bj;
+            string y = year;
+            try {
+                Task.Factory.StartNew(delegate { RefreshHolidaysOnce(y); });
+            } catch { }
+        }
+    }
+
+    static bool IsHoliday(DateTime bj) {
+        bool hit;
+        lock (HolidayLock) {
+            if (_holidayYear != bj.Year.ToString("0000")) return false;   // no data -> weekday rule
+            hit = _holidayDates[bj.ToString("yyyyMMdd")] != null;
+        }
+        return hit;
+    }
+
+    bool OffPeakNow() { return !IsPeakAt(CloudBeijing()); }
+
+    // Time until the tariff flips, and which way. The switch points are 09:00 /
+    // 12:00 / 14:00 / 18:00 on weekdays; walking 8 days at 15-minute steps always
+    // reaches a change (Friday 18:00 -> Monday 09:00 is the longest gap, 63 h).
+    //
+    // The scan MUST start at TODAY 00:15, not at tomorrow: from 06:00 the next
+    // switch is today's 09:00, and starting tomorrow reported 75 h instead of 3 h.
+    // 00:15 (not 00:00) keeps the first candidate strictly in the future, so a
+    // boundary moment reports the NEXT switch rather than itself.
+    TimeSpan UntilSwitch(out bool toPeak) {
+        DateTime bj = CloudBeijing();
+        bool nowPeak = IsPeakAt(bj);
+        DateTime d = bj.Date;
+        for (int day = 0; day <= 8; day++) {
+            for (int q = 1; q < 96; q++) {
+                DateTime c = d.AddMinutes(q * 15);
+                if (c <= bj) continue;
+                if (IsPeakAt(c) == nowPeak) continue;
+                toPeak = !nowPeak;
+                TimeSpan left = c - bj;
+                if (left < TimeSpan.Zero) left = TimeSpan.Zero;
+                return left;
+            }
+            d = d.AddDays(1);
+        }
+        toPeak = !nowPeak;
+        return TimeSpan.Zero;
     }
 
     // Three lines on the tablet: the clock, who is on duty, and today's spend.
@@ -10426,10 +10939,17 @@ public sealed class DshPet : Form {
     // ---------------------------------------------------------------- tick ---
 
     void OnTick() {
-        long tTick0 = _perfPhases ? Stopwatch.GetTimestamp() : 0;
+        // Always stamped: LastTickMs feeds the runtime ledger, and leaving it 0 made
+        // Ms(0) report "time since boot" - a 38,000,000 ms tick_avg in the log.
+        long tTick0 = Stopwatch.GetTimestamp();
         long tPh0 = tTick0;
         try {
+            long tHol = _perfPhases ? Stopwatch.GetTimestamp() : 0;
+            MaybeRefreshHolidays();
+            if (_perfPhases) { _phHoliday += Ms(tHol); }
+            long tPD = _perfPhases ? Stopwatch.GetTimestamp() : 0;
             if (_pollWant != 0) { int want = _pollWant; _pollWant = 0; PollNow(want == 2); }
+            if (_perfPhases) { _phPollDrain += Ms(tPD); }
             if (_perfPhases) { _phPoll += Ms(tPh0); tPh0 = Stopwatch.GetTimestamp(); }
 
             double dt = _timer.Interval / 1000.0;
@@ -10603,13 +11123,74 @@ public sealed class DshPet : Form {
 
             // Mark the tablet AFTER the re-render (see the note where _peakPush is set) and before the
             // push, so the new digits actually reach the screen.
-            if (anim || _dirty) {
-                RenderToCanvas();
+            // A parked rectangle must not wait for the next unrelated change: ask for a
+            // composite every tick until it goes out. The canvas already holds the right pixels,
+            // so only the push is needed - re-rendering here would repaint her box for nothing.
+            if (anim || _dirty || !_deferRect.IsEmpty) {
+                if (anim || _dirty) RenderToCanvas();
                 PushLayer();
             }
             if (_perfPhases) { _phTickTail += Ms(tPh); }
         } catch (Exception ex) { Log("tick: " + ex); }
         LastTickMs = Ms(tTick0);
+        if (_perfLog) {
+            _plTick += LastTickMs;
+            _plRender += LastRenderMs;
+            _plPush += LastPushMs;
+            // An average hides the frames that actually cause the stutter.
+            if (LastTickMs > _plTickMax) _plTickMax = LastTickMs;
+            if (LastRenderMs > _plRenderMax) _plRenderMax = LastRenderMs;
+            if (LastPushMs > _plPushMax) _plPushMax = LastPushMs;
+            _plFrames++;
+            if (LastPushMs > 0) _plPushes++;
+            double nowSec = NowSec();
+            if (_plLast <= 0) _plLast = nowSec;
+            if (nowSec - _plLast >= 1.0 && _plFrames > 0) {
+                // Push is reported two ways: averaged over frames (real per-frame cost,
+                // which is what the user feels) and summed over the second (total work).
+                Log("PERF frames=" + _plFrames +
+                    " tick_avg=" + (_plTick / _plFrames).ToString("0.00") +
+                    " render_avg=" + (_plRender / _plFrames).ToString("0.00") +
+                    " push_avg=" + (_plPush / _plFrames).ToString("0.00") +
+                    " pushes=" + _plPushes +
+                    " push_sum=" + _plPush.ToString("0.0") +
+                    // Area actually converted per push: this is the number that says
+                    // whether a stutter is about pixels or about something else.
+                    " fillPx=" + (_plFillPx / Math.Max(1, _plPushes)).ToString("0") +
+                    " fillMs=" + _plFillMs.ToString("0.0") +
+                    // The widest/tallest rectangle of the second exposes which path made
+                    // a huge push: a full-canvas rect means the whole-canvas branch ran.
+                    " maxRect=" + _plMaxRw + "x" + _plMaxRh +
+                    " full=" + _plFullFills +
+                    " MAX tick=" + _plTickMax.ToString("0.0") +
+                    " render=" + _plRenderMax.ToString("0.0") +
+                    " push=" + _plPushMax.ToString("0.0") +
+                    " bigMark=" + _plMarkW + "x" + _plMarkH + "@" + _plMarkX + "," + _plMarkY +
+                    " lay=" + _plRelayout + "/" + _plExprHit + "h" + _plExprMiss + "m" +
+                    " layMs=" + _plRelayoutMs.ToString("0.0") +
+                    " layMax=" + _plRelayoutMax.ToString("0.0") +
+                    " cvRebuild=" + _plCanvasRebuilt +
+                    " dib=" + _plDibOk + " hbm=" + _plHbitmap +
+                    " hbmMs=" + _plHbitmapMs.ToString("0.0") +
+                    " ulw=" + (_ulwBlt ? 1 : 0) +
+                    " budget=" + _timer.Interval +
+                    " every=" + _pushEvery + " skip=" + _pushSkip +
+                    // Time spent inside mciSendString this second. This is the number that
+                    // proves the sound path got cheap (or did not).
+                    " snd=" + SoundPool.SendCount + "/" + SoundPool.SendMs.ToString("0.0") + "ms");
+                _plTick = 0; _plRender = 0; _plPush = 0; _plFrames = 0; _plPushes = 0;
+                Log(PhaseReport(_plFrames));
+                ResetPhases();                  // else the next report averages the session
+                _plFillPx = 0; _plFillMs = 0; _plMaxRw = 0; _plMaxRh = 0; _plFullFills = 0;
+                _plDibOk = 0; _plHbitmap = 0; _plHbitmapMs = 0;
+                _plRelayout = 0; _plExprHit = 0; _plExprMiss = 0; _plRelayoutMs = 0;
+                _plRelayoutMax = 0; _plCanvasRebuilt = 0;
+                _plMarkBig = 0; _plMarkW = 0; _plMarkH = 0; _plMarkX = 0; _plMarkY = 0;
+                _plTickMax = 0; _plRenderMax = 0; _plPushMax = 0;
+                SoundPool.SendMs = 0; SoundPool.SendCount = 0;
+                _plLast = nowSec;
+            }
+        }
     }
 
     // fromTest: the menu / tray "test one charge" cue only pretends to spend.
@@ -11105,6 +11686,16 @@ public sealed class DshPet : Form {
     void Log(string msg) {
         try {
             File.AppendAllText(Path.Combine(_baseDir, "pet.log"),
+                DateTime.Now.ToString("s") + " " + msg + "\r\n");
+        } catch { }
+    }
+
+    // The holiday helpers run on a background thread and are static, so they
+    // cannot use the instance Log(); this one writes to the same pet.log through
+    // the static base directory.
+    static void LogHoliday(string msg) {
+        try {
+            File.AppendAllText(Path.Combine(AppBaseDir, "pet.log"),
                 DateTime.Now.ToString("s") + " " + msg + "\r\n");
         } catch { }
     }
@@ -12191,6 +12782,14 @@ public sealed class DshPet : Form {
             return;
         }
 
+        // Standalone: shrinking her must not leave the old outline behind.
+        if (Array.IndexOf(args, "--sizeghost") >= 0) {
+            pet.RunSizeGhostTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
         // Standalone: no pulling while a deduction is running.
         if (Array.IndexOf(args, "--chargewait") >= 0) {
             pet.NoSaveForTest();
@@ -12213,6 +12812,14 @@ public sealed class DshPet : Form {
         if (Array.IndexOf(args, "--radarresidue") >= 0) {
             pet.NoSaveForTest();
             pet.RunRadarResidueTest();
+            Console.WriteLine("done");
+            Application.Exit();
+            return;
+        }
+
+        // Standalone: a global mouse hook must never outlive the menu it serves.
+        if (Array.IndexOf(args, "--hookcheck") >= 0) {
+            pet.RunHookLeakTest();
             Console.WriteLine("done");
             Application.Exit();
             return;
@@ -12412,12 +13019,14 @@ public sealed class DshPet : Form {
         "--chargewait", "--clickaway", "--cuevolume", "--customeffect", "--dialogs",
         "--crumbshot", "--dialogshot", "--editshot", "--fxcheck", "--peakcheck", "--peaktick",
         "--exprcheck", "--feedpause", "--feedrefresh", "--feedtouch", "--geom", "--hearts",
+        "--hookcheck",
         "--iconsheet", "--iconshot", "--inertia", "--ironbump", "--ironflash", "--ironinteract",
         "--ironpot", "--ironshot", "--ironstack", "--librarymigrate", "--manualradar", "--menucheck",
         "--menudark", "--menushot", "--multitarget", "--mutecheck", "--panelcheck", "--patcheck",
         "--pattool", "--pattrigger", "--perf", "--perfscale", "--potsentry", "--pottrace",
         "--preview", "--radarresidue", "--seam", "--seatjerk", "--seatjerkdrag", "--selftest",
-        "--sentrytest", "--shot", "--shotdemo", "--shotwin", "--simchain", "--snapside",
+        "--sentrytest", "--shot", "--shotdemo", "--shotwin", "--simchain", "--sizeghost",
+        "--snapside",
         "--soundcues", "--stackclip", "--testtopdebt", "--textbounce", "--topup", "--trayicon",
         "--ulwcheck", "--winicons", "--wornpass"
     };
@@ -12989,10 +13598,28 @@ public sealed class DshPet : Form {
         ApplyBalancePublic(30.00, true);
         StartCredit(5.00);
         PumpTicks(2);
-        sw.Restart(); for (int i = 0; i < n; i++) PumpTicks(1);
+        double accRender = 0, accPush = 0;
+        // The phase timers have to be ON here, or every line they print is "not
+        // measured" rather than "fast" - which is exactly how the first version of
+        // this ledger misled me.
+        _perfPhases = true;
+        ResetPhases();
+        sw.Restart();
+        for (int i = 0; i < n; i++) {
+            PumpTicks(1);
+            accRender += LastRenderMs;
+            accPush += LastPushMs;
+        }
         double fallFrame = sw.Elapsed.TotalMilliseconds / n;
         Console.WriteLine("  bowl falling    : " + fallFrame.ToString("0.00") + " ms/tick" +
                           "  (" + (fallFrame / _timer.Interval * 100).ToString("0") + " % of the budget)");
+        // Where the drop frame actually goes: the render, the push, and the rest of
+        // the tick (physics, expression, radar, hit map, ...).
+        Console.WriteLine("    drop split    : render " + (accRender / n).ToString("0.00") +
+                          "  push " + (accPush / n).ToString("0.00") +
+                          "  other " + ((fallFrame - (accRender + accPush) / n)).ToString("0.00") + " ms");
+        Console.WriteLine(PhaseReport(n));
+        _perfPhases = false;
 
         // What the mouse-drag path really costs per animation frame now that
         // OnMouseMove only marks the widget dirty (it used to repaint the whole
@@ -13007,6 +13634,40 @@ public sealed class DshPet : Form {
         Console.WriteLine("  drag " + extra + " moves + 1 tick: " + dragTick.ToString("0.00") + " ms/tick" +
                           "  (" + (dragTick / _timer.Interval * 100).ToString("0") +
                           " % of the budget; over 100 % means the animation stutters)");
+        ResetDemoForTest();
+        SnapToCorner(true);
+        RenderToCanvas();
+        PushLayer();
+
+        // ---- the radar's real box, measured ----
+        // maxRect was 749x1600 on radar frames: width fixed, height still the whole
+        // canvas. Print the box and the frame's dirty rectangle at two heights so the
+        // full-height part can be attributed instead of guessed at.
+        Console.WriteLine("  --- radar dirty box ---");
+        int[] radarY = new int[] { 500, 1450 };
+        for (int ri = 0; ri < radarY.Length; ri++) {
+            ResetDemoForTest();
+            SnapToCorner(true);                // parks her back in the corner
+            StartCredit(3.00);
+            PumpTicks(3);
+            if (_rices.Count > 0) {
+                _rices[0].X = 1200; _rices[0].Y = radarY[ri];
+                _rices[0].VX = 0; _rices[0].VY = 0;
+            }
+            SetBowlWaitForTest(9999);          // past BowlWaitSec -> the radar locks
+            _perfPhases = true;
+            ResetPhases();
+            PumpTicks(3);
+            Rectangle rb = _rices.Count > 0 ? RadarBounds(_rices[0]) : Rectangle.Empty;
+            Rectangle dr = _dirtyRect;
+            Console.WriteLine("  radar y=" + radarY[ri] +
+                              "  bowlOn=" + (_rices.Count > 0) +
+                              "  blip=" + _blip.On + " S=" + _blip.S.ToString("0") +
+                              "  radarBox=" + rb.X + "," + rb.Y + " " + rb.Width + "x" + rb.Height +
+                              "  dirtyRect=" + dr.X + "," + dr.Y + " " + dr.Width + "x" + dr.Height +
+                              "  canvas=" + _canvas.Width + "x" + _canvas.Height);
+            _perfPhases = false;
+        }
         ResetDemoForTest();
         SnapToCorner(true);
         RenderToCanvas();
@@ -13601,6 +14262,157 @@ public sealed class DshPet : Form {
     // her away while it is dragged across her. This parks a bowl on her, renders a
     // few frames, takes the bowl away and compares the widget with how it looked
     // before - any missing pixels are the smear.
+    public void RunHookLeakTest() {
+        GoOffline();
+        _noNetwork = true;
+        NoSaveForTest();
+        Console.WriteLine("global mouse hook lifetime");
+        bool cleanStart = !HookInstalledForTest;
+        // Arm it the way the right-click path used to, with no _menu for it to serve.
+        ArmMenuClickHook();
+        bool armed = HookInstalledForTest;
+        // One tick of the sweep has to be enough to let it go.
+        ApplyPendingMenuClose();
+        bool released = !HookInstalledForTest;
+        Console.WriteLine("  fresh   : installed=" + (!cleanStart) + "   (want False)");
+        Console.WriteLine("  armed   : installed=" + armed + "   (want True)");
+        Console.WriteLine("  swept   : installed=" + (!released) + "   (want False)");
+        // ...and it must NOT steal a hook that an open menu still needs.
+        _menu.Show(MenuOrigin());
+        ArmMenuClickHook();
+        ApplyPendingMenuClose();
+        bool keptWithMenu = HookInstalledForTest;
+        _menu.Close();
+        ApplyPendingMenuClose();
+        bool goneAfterClose = !HookInstalledForTest;
+        Console.WriteLine("  menu up : installed=" + keptWithMenu + "   (want True)");
+        Console.WriteLine("  closed  : installed=" + (!goneAfterClose) + "   (want False)");
+        bool ok = cleanStart && armed && released && keptWithMenu && goneAfterClose;
+        Console.WriteLine("  verdict: " + (ok
+            ? "OK - a global mouse hook can never outlive the menu it serves, and one tick after" +
+              " the UI closes it is released"
+            : "FAIL - clean=" + cleanStart + " armed=" + armed + " released=" + released +
+              " keptWithMenu=" + keptWithMenu + " goneAfterClose=" + goneAfterClose));
+    }
+
+    // Count opaque canvas pixels OUTSIDE the widget box: anything there is a leftover.
+    int _ghostPixels;
+    Rectangle _ghostBox;
+
+    void GhostScan() {
+        Rectangle keep = WidgetRect();
+        int n = 0;
+        Rectangle box = Rectangle.Empty;
+        Buf b = new Buf(_canvas);
+        try {
+            for (int y = 0; y < b.H; y++) {
+                int row = y * b.Stride;
+                for (int x = 0; x < b.W; x++) {
+                    if (b.P[row + x * 4 + 3] <= 8) continue;
+                    if (x >= keep.Left && x < keep.Right && y >= keep.Top && y < keep.Bottom) continue;
+                    n++;
+                    if (box.IsEmpty) box = new Rectangle(x, y, 1, 1);
+                    else box = Rectangle.Union(box, new Rectangle(x, y, 1, 1));
+                }
+            }
+        } finally { b.Dispose(); }
+        _ghostPixels = n;
+        _ghostBox = box;
+    }
+
+    // The DIB is the buffer UpdateLayeredWindow composites, i.e. what the user sees. The canvas
+    // can be clean while this still holds the previous frame's pixels - then the defect is the
+    // dirty rectangle not COVERING the area, not the renderer.
+    void GhostScanDib() {
+        _ghostPixels = 0; _ghostBox = Rectangle.Empty;
+        if (_memBmp == IntPtr.Zero || _memBits == IntPtr.Zero || _memW <= 0) { _ghostPixels = -1; return; }
+        int w = _memW, h = _memH;
+        byte[] buf = new byte[w * h * 4];
+        Marshal.Copy(_memBits, buf, 0, buf.Length);
+        Rectangle keep = WidgetRect();
+        int n = 0;
+        Rectangle box = Rectangle.Empty;
+        for (int y = 0; y < h; y++) {
+            int row = y * w * 4;
+            for (int x = 0; x < w; x++) {
+                if (buf[row + x * 4 + 3] <= 8) continue;
+                if (x >= keep.Left && x < keep.Right && y >= keep.Top && y < keep.Bottom) continue;
+                n++;
+                if (box.IsEmpty) box = new Rectangle(x, y, 1, 1);
+                else box = Rectangle.Union(box, new Rectangle(x, y, 1, 1));
+            }
+        }
+        _ghostPixels = n;
+        _ghostBox = box;
+    }
+
+    // Ticks with real wall time between them: PushDue() throttles on the clock, so a tight
+    // loop of PumpTicks() can never let a parked push through and the probe would be blind.
+    void SettleTicks(int n) {
+        for (int i = 0; i < n; i++) {
+            PumpTicks(1);
+            System.Threading.Thread.Sleep(25);
+        }
+    }
+
+    public void RunSizeGhostTest() {
+        GoOffline();
+        _noNetwork = true;
+        NoSaveForTest();
+        Console.WriteLine("size-change ghost: canvas residue + a parked push that must drain");
+        DiagErase = true;
+
+        SetPixelSize(624);
+        SettleTicks(4);
+        GhostScan();
+        Console.WriteLine("  big 624 : canvasOutside=" + _ghostPixels);
+
+        // The frame that changes the size also renders and pushes. Force the push to be throttled
+        // exactly as it is in the real app (a composite went out moments earlier), so the
+        // rectangle lands in _deferRect and the drain path is what gets tested.
+        _dirty = true;
+        PumpTicks(1);
+        SetPixelSize(340);
+        bool parked = !_deferRect.IsEmpty;
+        Rectangle parkedRect = _deferRect;
+        int ticksToDrain = -1;
+        for (int i = 0; i < 12; i++) {
+            PumpTicks(1);
+            System.Threading.Thread.Sleep(10);
+            if (_deferRect.IsEmpty) { ticksToDrain = i + 1; break; }
+        }
+        GhostScan();
+        Console.WriteLine("  small340: canvasOutside=" + _ghostPixels +
+                          "   parkedAfterChange=" + parked +
+                          (parked ? "  rect=" + parkedRect : ""));
+        Console.WriteLine("  drain   : ticksToDrain=" + ticksToDrain + " (want 1..6, -1 = never)");
+        // A parked rectangle left behind is the bug: the screen keeps the old outline.
+        bool drained = !parked || (ticksToDrain >= 1 && ticksToDrain <= 6);
+        bool canvasClean = _ghostPixels == 0;
+        Console.WriteLine("  verdict: " + ((canvasClean && drained)
+            ? "OK - no canvas residue, and a throttled push is flushed on its own within " + ticksToDrain + " tick(s)"
+            : "FAIL - canvasOutside=" + _ghostPixels + " parked=" + parked +
+              " ticksToDrain=" + ticksToDrain));
+
+        // Back up to the big size: same assertions, because the same path runs.
+        SetPixelSize(624);
+        for (int i = 0; i < 12; i++) {
+            PumpTicks(1);
+            System.Threading.Thread.Sleep(10);
+            if (_deferRect.IsEmpty) break;
+        }
+        GhostScan();
+        Console.WriteLine("  back 624: canvasOutside=" + _ghostPixels +
+                          "   parked=" + !_deferRect.IsEmpty);
+        DiagErase = false;
+        SetPixelSize(454);
+        for (int i = 0; i < 12; i++) {
+            PumpTicks(1);
+            System.Threading.Thread.Sleep(10);
+            if (_deferRect.IsEmpty) break;
+        }
+    }
+
     public void RunBowlOverGirlTest() {
         GoOffline();
         _noNetwork = true;
@@ -16218,6 +17030,12 @@ public sealed class DshPet : Form {
     double _patBiasY = PatPalmBiasY;
     double _patScale = PatDrawScale;
     double _patRef = PatRefScale;
+    // The hand's draw box for the frame PatGeometry last laid out. Publishing it
+    // keeps the painter and the layout in agreement: the mirror step reflects
+    // handX + dw, so a painter sizing the hand differently would put the palm off
+    // her crown on the right-hand side.
+    int _patLastDw = 1;
+    int _patLastDh = 1;
     // How much of the reference's compression to apply. 1.0 is the reference's own 11.4 %; the tool
     // exposes it because "how much she gives" is a taste call that only the eye can settle - the exact
     // case the interactive-tool note describes.
@@ -16412,10 +17230,13 @@ public sealed class DshPet : Form {
                                             "Z" : " (no server stamp yet - falls back to local)"));
         DateTime bj = CloudBeijing();
         Console.WriteLine("  beijing : " + bj.ToString("yyyy-MM-dd HH:mm:ss") +
-                          "  offPeak=" + OffPeakNow() + "  (rule: 00:30-08:30)");
+                          "  offPeak=" + OffPeakNow() +
+                          "  (rule: Mon-Fri 09:00-12:00 & 14:00-18:00 peak;"
+                          + " weekends and statutory holidays off-peak)");
 
-        // Boundary check: the rule is a time-of-day test, so probe it directly rather than waiting
-        // for the clock to reach 00:30. Saved and restored so the running readout is unaffected.
+        // Boundary check: the rule is a weekday/time-of-day test, so probe it directly rather than
+        // waiting for a real boundary to come round. Saved and restored so the live readout is
+        // unaffected.
         DateTime savedStamp = _cloudStamp;
         DateTime savedLocal = _cloudLocalStamp;
         bool savedHave = _haveCloudTime;
@@ -16423,20 +17244,31 @@ public sealed class DshPet : Form {
         _cloudLocalStamp = DateTime.UtcNow;
         // CloudNow() = _cloudStamp + (UtcNow - _cloudLocalStamp), so setting the stamp to a Beijing
         // wall time minus 8 h makes CloudBeijing() land exactly on it.
+        // Probe the rule directly. 2026-10-26 is a Monday, so day 0..4 walk Mon
+        // to Fri and 5..6 are the weekend. Each row is [dayOffset, hour, minute,
+        // wantOffPeak]: the four weekday switch points plus a weekend all-day case.
+        // The stamp is set to the Beijing wall time minus 8 h because CloudBeijing
+        // adds those 8 hours back.
+        DateTime monday = new DateTime(2026, 10, 26, 0, 0, 0, DateTimeKind.Utc);
         int[][] probes = new int[][] {
-            new int[] { 0, 29, 0 }, new int[] { 0, 31, 1 },
-            new int[] { 8, 29, 1 }, new int[] { 8, 31, 0 },
-            new int[] { 12, 0, 0 }
+            new int[] { 0,  8, 59, 1 }, new int[] { 0,  9,  1, 0 },
+            new int[] { 0, 11, 59, 0 }, new int[] { 0, 12,  1, 1 },
+            new int[] { 0, 13, 59, 1 }, new int[] { 0, 14,  1, 0 },
+            new int[] { 0, 17, 59, 0 }, new int[] { 0, 18,  1, 1 },
+            new int[] { 4, 10,  0, 0 }, new int[] { 5, 10,  0, 1 },
+            new int[] { 6, 10,  0, 1 }, new int[] { 6, 22,  0, 1 }
         };
+        string[] dayName = new string[] { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
         bool boundsOk = true;
         for (int i = 0; i < probes.Length; i++) {
-            _cloudStamp = DateTime.UtcNow.Date.AddHours(probes[i][0] - 8).AddMinutes(probes[i][1]);
+            _cloudStamp = monday.AddDays(probes[i][0]).AddHours(probes[i][1] - 8).AddMinutes(probes[i][2]);
             bool got = OffPeakNow();
-            bool want = probes[i][2] == 1;
+            bool want = probes[i][3] == 1;
             if (got != want) boundsOk = false;
-            Console.WriteLine("  probe   : " + probes[i][0].ToString("00") + ":" +
-                              probes[i][1].ToString("00") + " -> offPeak=" + got +
-                              " (want " + want + ")  " + (got == want ? "ok" : "MISMATCH"));
+            Console.WriteLine("  probe   : " + dayName[probes[i][0]] + " " +
+                              probes[i][1].ToString("00") + ":" + probes[i][2].ToString("00") +
+                              " -> offPeak=" + got + " (want " + want + ")  " +
+                              (got == want ? "ok" : "MISMATCH"));
         }
         _cloudStamp = savedStamp; _cloudLocalStamp = savedLocal; _haveCloudTime = savedHave;
 
@@ -16533,26 +17365,132 @@ public sealed class DshPet : Form {
         DateTime cs = _cloudStamp; DateTime cl = _cloudLocalStamp; bool ch = _haveCloudTime;
         _haveCloudTime = true; _cloudLocalStamp = DateTime.UtcNow;
         bool cdOk = true;
-        // 06:00 Beijing -> off-peak, so it counts down to 08:30 (2h30m).
-        _cloudStamp = DateTime.UtcNow.Date.AddHours(6 - 8);
-        bool toPeak1; TimeSpan l1 = UntilSwitch(out toPeak1);
-        if (!toPeak1 || Math.Abs(l1.TotalMinutes - 150) > 1.5) cdOk = false;
-        Console.WriteLine("  countdn : 06:00 -> toPeak=" + toPeak1 + " left=" +
-                          ((int)l1.TotalHours) + ":" + l1.Minutes.ToString("00") +
-                          " (want toPeak=True, 2:30)  " + (cdOk ? "ok" : "MISMATCH"));
-        // 12:00 Beijing -> peak, counts down to the next 00:30 (12h30m).
-        _cloudStamp = DateTime.UtcNow.Date.AddHours(12 - 8);
-        bool toPeak2; TimeSpan l2 = UntilSwitch(out toPeak2);
-        bool cd2 = !toPeak2 && Math.Abs(l2.TotalMinutes - 750) > 1.5;
-        if (cd2) cdOk = false;
-        Console.WriteLine("  countdn : 12:00 -> toPeak=" + toPeak2 + " left=" +
-                          ((int)l2.TotalHours) + ":" + l2.Minutes.ToString("00") +
-                          " (want toPeak=False, 12:30)  " + (cd2 ? "MISMATCH" : "ok"));
+        // Countdown cases on the current rule, pinned to a Monday so the weekday
+        // test cannot depend on what day the suite happens to run.
+        //   peak 09:00-12:00 and 14:00-18:00 Mon-Fri; everything else off-peak.
+        //   [dayOffset, hour, minute, wantToPeak, wantMinutes]
+        // wantToPeak is the flag for what comes NEXT (true = the next switch
+        // enters peak), which is the opposite of the state the row is in.
+        //     0 Mon 06:00 off  -> 09:00 peak      (3 h)
+        //     0 Mon 10:00 peak -> 12:00 off       (2 h)
+        //     0 Mon 12:30 off  -> 14:00 peak      (1 h 30 m)
+        //     0 Mon 16:00 peak -> 18:00 off       (2 h)
+        //     6 Sun 19:00 off  -> Mon 09:00 peak  (14 h)
+        DateTime cdMonday = new DateTime(2026, 10, 26, 0, 0, 0, DateTimeKind.Utc);
+        int[][] cdCases = new int[][] {
+            new int[] { 0,  6,  0, 1, 180 },
+            new int[] { 0, 10,  0, 0, 120 },
+            new int[] { 0, 12, 30, 1,  90 },
+            new int[] { 0, 16,  0, 0, 120 },
+            new int[] { 6, 19,  0, 1, 840 }
+        };
+        string[] cdDay = new string[] { "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun" };
+        for (int ci = 0; ci < cdCases.Length; ci++) {
+            _cloudStamp = cdMonday.AddDays(cdCases[ci][0]).AddHours(cdCases[ci][1] - 8)
+                                  .AddMinutes(cdCases[ci][2]);
+            bool toPeak1; TimeSpan l1 = UntilSwitch(out toPeak1);
+            bool wantToPeak = cdCases[ci][3] == 1;   // 4th column = expected toPeak
+            bool caseOk = (toPeak1 == wantToPeak) &&
+                          Math.Abs(l1.TotalMinutes - cdCases[ci][4]) <= 1.5;
+            if (!caseOk) cdOk = false;
+            Console.WriteLine("  countdn : " + cdDay[cdCases[ci][0]] + " " +
+                              cdCases[ci][1].ToString("00") + ":" +
+                              cdCases[ci][2].ToString("00") + " -> toPeak=" + toPeak1 +
+                              " left=" + ((int)l1.TotalHours).ToString("00") + ":" +
+                              l1.Minutes.ToString("00") + ":" + l1.Seconds.ToString("00") +
+                              " (want " + (wantToPeak ? "peak" : "off") + ", " +
+                              (cdCases[ci][4] / 60) + "h" +
+                              (cdCases[ci][4] % 60).ToString("00") + "m)  " +
+                              (caseOk ? "ok" : "MISMATCH"));
+        }
+        // The live readout must also be sane: whatever the clock says now, a
+        // countdown that is not positive would print as a negative time.
+        bool toPeakNow; TimeSpan leftNow = UntilSwitch(out toPeakNow);
+        if (leftNow.TotalSeconds <= 0) cdOk = false;
+        Console.WriteLine("  countdn : current    -> toPeak=" + toPeakNow + " left=" +
+                          ((int)leftNow.TotalHours) + ":" + leftNow.Minutes.ToString("00") +
+                          ":" + leftNow.Seconds.ToString("00") +
+                          "  " + (cdOk ? "ok" : "MISMATCH"));
         _cloudStamp = cs; _cloudLocalStamp = cl; _haveCloudTime = ch;
 
-        bool ok = boundsOk && bodyToggles && bodyIgnored && headNoToggle && spendOk && cdOk;
+        // ---- statutory holidays must be off-peak all day ----
+        // 2026-10-01 is a Thursday, so under the bare weekday rule it would read
+        // as peak; the National Day entry must make it off-peak instead. The
+        // built-in table is swapped in directly, and the daily network refresh is
+        // pushed out of the way so it cannot replace the table mid-check.
+        DateTime holSavedTry = _holidayLastTry;
+        string holYear = "2026";
+        DateTime holThu = new DateTime(2026, 10, 1, 0, 0, 0, DateTimeKind.Utc);
+        int[][] holCases = new int[][] {
+            new int[] { 0, 10,  0, 1 },      // Thu 10-01 holiday  -> off-peak
+            new int[] { 1, 10,  0, 1 },      // Fri 10-02 holiday  -> off-peak
+            new int[] { 8, 10,  0, 0 },      // Fri 10-09 workday  -> peak
+            new int[] { 9, 10,  0, 1 }       // Sat 10-10 weekend  -> off-peak
+        };
+        bool holOk = true;
+        LoadHolidayBuiltIn(holYear);
+        // CloudBeijing() = _cloudStamp + (UtcNow - _cloudLocalStamp), so BOTH have
+        // to be re-anchored here; the countdown probe above left _cloudLocalStamp
+        // pointing at an older instant, which made every case read the live clock.
+        _holidayLastTry = holThu.AddDays(30);
+        _haveCloudTime = true;
+        _cloudLocalStamp = DateTime.UtcNow;
+        for (int i = 0; i < holCases.Length; i++) {
+            _cloudStamp = holThu.AddDays(holCases[i][0]).AddHours(holCases[i][1] - 8)
+                                 .AddMinutes(holCases[i][2]);
+            bool got = OffPeakNow();
+            bool want = holCases[i][3] == 1;
+            if (got != want) holOk = false;
+            Console.WriteLine("  holiday : 2026-10-" + (1 + holCases[i][0]).ToString("00") +
+                              " " + (holCases[i][1]).ToString("00") + ":00 -> offPeak=" + got +
+                              " (want " + want + ")  " + (got == want ? "ok" : "MISMATCH"));
+        }
+        _holidayLastTry = holSavedTry;
+        _cloudStamp = savedStamp; _cloudLocalStamp = savedLocal; _haveCloudTime = savedHave;
+
+        // ---- year rollover (the pet kept running across New Year) ----
+        // On 2027-01-01, a Friday, 2026's holiday table no longer applies. The
+        // readout must fall back to the plain weekday rule for a year with no
+        // published data, NOT treat the day as a holiday and NOT crash.
+        DateTime rollSavedStamp = _cloudStamp;
+        DateTime rollSavedLocal = _cloudLocalStamp;
+        bool rollSavedHave = _haveCloudTime;
+        DateTime rollSavedDay = _holidayDayChecked;
+        DateTime rollSavedTry = _holidayLastTry;
+        bool rollOk = true;
+        // 2026-12-31 23:50 Beijing -> the table for 2026 is the loaded one
+        _haveCloudTime = true;
+        _cloudLocalStamp = DateTime.UtcNow;
+        _cloudStamp = new DateTime(2026, 12, 31, 23, 50, 0, DateTimeKind.Utc).AddHours(-8);
+        _holidayDayChecked = DateTime.MinValue;
+        MaybeRefreshHolidays();
+        string yBefore = _holidayYear;
+        // cross midnight into 2027
+        _cloudStamp = new DateTime(2027, 1, 1, 0, 10, 0, DateTimeKind.Utc).AddHours(-8);
+        _holidayLastTry = new DateTime(2027, 1, 2, 0, 0, 0, DateTimeKind.Utc);   // block the net call
+        MaybeRefreshHolidays();
+        string yAfter = _holidayYear;
+        // 2027 has no published data, so the correct outcome after the rollover is
+        // an EMPTY table (weekday rule), not the 2026 one carried forward.
+        bool rollIdx = (yBefore == "2026") && (yAfter.Length == 0);
+        if (!rollIdx) rollOk = false;
+        // at 10:00 the Friday must read peak while 2027 has no table
+        _cloudStamp = new DateTime(2027, 1, 1, 10, 0, 0, DateTimeKind.Utc).AddHours(-8);
+        bool rollOffPeak = OffPeakNow();
+        bool rollHoliday = IsHoliday(CloudBeijing());
+        if (rollHoliday) rollOk = false;         // must not claim a holiday it has no data for
+        Console.WriteLine("  rollover: 2026 -> " + yBefore + " | 2027 -> " + yAfter +
+                          " | 2027-01-01 10:00 offPeak=" + rollOffPeak +
+                          " isHoliday=" + rollHoliday +
+                          "  " + (rollOk ? "ok (falls back to the weekday rule)" : "MISMATCH"));
+        _holidayDayChecked = rollSavedDay;
+        _holidayLastTry = rollSavedTry;
+        _cloudStamp = rollSavedStamp; _cloudLocalStamp = rollSavedLocal; _haveCloudTime = rollSavedHave;
+
+        bool ok = boundsOk && bodyToggles && bodyIgnored && headNoToggle && spendOk && cdOk
+                  && holOk && rollOk;
         Console.WriteLine("  verdict: " + (ok
-            ? "OK - the tariff line follows the server clock and the 00:30/08:30 boundaries are exact"
+            ? "OK - tariff follows the server clock; Mon-Fri 09:00/12:00/14:00/18:00 and holidays are exact"
             : "FAIL - see the probes"));
     }
 
@@ -16993,21 +17931,57 @@ public sealed class DshPet : Form {
             PatGeometry(f, out hx, out hy, out sc, out scx, out sh);
             if (scx < minSx) minSx = scx;
             if (scx > maxSx) maxSx = scx;
+            // _patLastDw/_patLastDh are the box the painter actually draws, i.e. the
+            // hand after the widget-size scaling. Measuring the native sprite here
+            // reported the wrong clipping at every size but 454.
             int visibleTop = Math.Max(0, hy);
-            int visibleBot = Math.Min(_h, hy + _patHand[f].Height);
+            int visibleBot = Math.Min(_h, hy + _patLastDh);
             int visible = visibleBot - visibleTop;
             if (visible < minVisible) minVisible = visible;
             if (visible > 0) anyReaches = true;
-            bool inX = hx > -_patHand[f].Width && hx < _w;
+            bool inX = hx > -_patLastDw && hx < _w;
             int over = 0;
             if (hx < 0) over = -hx;
-            if (hx + _patHand[f].Width > _w) over = Math.Max(over, hx + _patHand[f].Width - _w);
+            if (hx + _patLastDw > _w) over = Math.Max(over, hx + _patLastDw - _w);
             if (over > worstOut) { worstOut = over; worstWhere = "frame " + f; }
-            Console.WriteLine("    f" + f + " hand=" + _patHand[f].Width + "x" + _patHand[f].Height +
+            Console.WriteLine("    f" + f + " hand=" + _patLastDw + "x" + _patLastDh +
+                              " (art " + _patHand[f].Width + "x" + _patHand[f].Height + ")" +
                               " at (" + hx + "," + hy + ")  squash=" + sc.ToString("0.000") +
-                              "  visibleRows=" + visible + "/" + _patHand[f].Height +
+                              "  visibleRows=" + visible + "/" + _patLastDh +
                               "  inWidgetX=" + inX);
         }
+
+        // ---- the hand must scale with the widget ----
+        // The bug: the hand's POSITION followed the size (k = _h/454) while its BOX
+        // stayed at the native 446x392, so 340 showed a big hand on a small pet and
+        // 624 a small hand on a big one. This lays one frame out at all three sizes
+        // and requires the box to scale, not just move.
+        int szSaveW = _w, szSaveH = _h;
+        double szSaveScale = _scale;
+        int[] szPx = new int[] { 340, 454, 624 };
+        int sizeBaseW = 0, sizeBaseH = 0;
+        bool sizeOk = true;
+        for (int si = 0; si < szPx.Length; si++) {
+            _w = szPx[si]; _h = szPx[si]; _scale = szPx[si] / 1024.0;
+            int phx, phy; float psc, pscx; int psh;
+            PatGeometry(2, out phx, out phy, out psc, out pscx, out psh);
+            if (si == 0) { sizeBaseW = _patLastDw; sizeBaseH = _patLastDh; }
+            // every frame must agree with the widget ratio 340/454 or 624/454
+            bool rowOk = (Math.Abs((double)_patLastDw - _patHand[2].Width * _patScale * (szPx[si] / 454.0)) <= 1.0);
+            if (!rowOk) sizeOk = false;
+            Console.WriteLine("  patsize : " + szPx[si] + "px -> hand=" + _patLastDw + "x" + _patLastDh +
+                              "  (want " + Math.Round(_patHand[2].Width * _patScale * (szPx[si] / 454.0)) +
+                              "x" + Math.Round(_patHand[2].Height * _patScale * (szPx[si] / 454.0)) +
+                              ")  " + (rowOk ? "ok" : "MISMATCH"));
+        }
+        bool sizeMonotonic = (_patLastDw > sizeBaseW) && (sizeBaseW > 0);
+        if (!sizeMonotonic) sizeOk = false;
+        Console.WriteLine("  patsize : monotonic 340<624 = " + sizeMonotonic +
+                          "  " + (sizeOk ? "ok (the hand follows the size setting)"
+                                        : "MISMATCH (the hand is a fixed size)"));
+        _w = szSaveW; _h = szSaveH; _scale = szSaveScale;
+        int szx, szy; float szsc, szscx; int szsh;
+        PatGeometry(2, out szx, out szy, out szsc, out szscx, out szsh);
 
         // Now the pixels: pat ON, frame 2 (the lowest hand, most contact).
         _patActive = true;
@@ -17079,14 +18053,21 @@ public sealed class DshPet : Form {
             bool savedRight = _snapRight;
             int savedHeadX = _headX;
             for (int f = 0; f < PAT_FRAMES; f++) {
-                _snapRight = false; _headX = 304;
+                // A symmetric pair for THIS widget: 150 on the left mirrors to
+                // _w - 150 on the right. The old pair (304 / 454-304) used the 454
+                // preset's numbers on a 340 widget, so the two cases were not mirrors
+                // of each other and the sum could never reach _w - 1.
+                _snapRight = false; _headX = 150;
                 int lx, ly; float lsc, lscx; int lsh;
                 PatGeometry(f, out lx, out ly, out lsc, out lscx, out lsh);
-                _snapRight = true; _headX = 454 - 304;
+                _snapRight = true; _headX = _w - 150;
                 int rx2, ry2; float rsc, rscx; int rsh;
                 PatGeometry(f, out rx2, out ry2, out rsc, out rscx, out rsh);
-                // The widget is _w wide: a mirrored hand must land so the two add up to _w.
-                int err = Math.Abs(lx + rx2 + 446 - (_w - 1));
+                // The widget is _w wide, so a mirrored hand must land such that the two
+                // boxes add up to _w. The width is the DRAWN box (_patLastDw), not the
+                // native 446: once the hand began scaling with the widget, a hard-coded
+                // 446 reported a 226 px mirror error at every size but 454.
+                int err = Math.Abs(lx + rx2 + _patLastDw - (_w - 1));
                 if (err > mirrorWorst) mirrorWorst = err;
                 if (err > 2) mirrorOk = false;
             }
@@ -17097,7 +18078,7 @@ public sealed class DshPet : Form {
                           " px   (must be <= 2, or the hand ignores the mirror)" +
                           "  " + (mirrorOk ? "ok" : "MISMATCH"));
         bool ok = loaded && gained > 2000 && residual == 0 && anyReaches && minVisible >= 40
-                  && squashVisible && mirrorOk;
+                  && squashVisible && mirrorOk && sizeOk;
         Console.WriteLine("  verdict: " + (ok
             ? "OK - five hand frames load, every frame reaches into the canvas, drawing the pat adds a large visible area, and switching it off leaves the rest frame byte-identical"
             : "FAIL - loaded=" + loaded + " gained=" + gained + " residual=" + residual +
@@ -17175,8 +18156,12 @@ public sealed class DshPet : Form {
         // as the reference does, and no separate "descent" term is needed.
         double k = _h / 454.0;                       // widget px per real-sprite px
         int crownY = (int)Math.Round(40.0 * _patRef * k);
-        int dw = Math.Max(1, (int)Math.Round(_patHand[frame].Width * _patScale));
-        int dh = Math.Max(1, (int)Math.Round(_patHand[frame].Height * _patScale));
+        // k belongs on the hand's box as well as on her crown. The hand art and the
+        // 454 sprite are sampled in the same space, so without this the hand stays at
+        // its native size while she scales - the "big hand on a small pet" report.
+        int dw = Math.Max(1, (int)Math.Round(_patHand[frame].Width * _patScale * k));
+        int dh = Math.Max(1, (int)Math.Round(_patHand[frame].Height * _patScale * k));
+        _patLastDw = dw; _patLastDh = dh;
         double palmFx = PatPalmX[frame] + _patBiasX;
         double palmFy = PatPalmY[frame] + _patBiasY;
         // Overridable so --pattool can drive this exact code. The constants are the shipping values,
@@ -17274,8 +18259,9 @@ public sealed class DshPet : Form {
         // numbers can be checked against the widget, but the canvas is screen-sized and the widget
         // sits at (_offX, _offY). Without these the hand lands in the canvas's top-left corner, far
         // from her - which the frame dump showed immediately while the geometry report looked right.
-        int dw = Math.Max(1, (int)Math.Round(hand.Width * _patScale));
-        int dh = Math.Max(1, (int)Math.Round(hand.Height * _patScale));
+        // Size comes from PatGeometry so the box and the mirrored position agree.
+        int dw = _patLastDw;
+        int dh = _patLastDh;
         // FLIPPED when she is in the bottom-right corner, so the hand enters from the side she is on.
         //
         // The earlier fix mirrored the hand's POSITION but not its picture, and that is only half of it:
