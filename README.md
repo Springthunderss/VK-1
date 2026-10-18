@@ -11,7 +11,8 @@
 | --- | --- | --- | --- |
 | 🪟 **Windows** | **v3** | PowerShell 5.1 + 内嵌 C# | 见下文「Windows 版」 |
 | 🍎 **macOS** | **v1.3.1** | Swift + AppKit | 见下文「macOS 版」 |
-| 🌐 **DSH 网页插件** | 社区维护 | DSH bundle（JS） | 由 [@YCTS-otree](https://github.com/YCTS-otree) 移植并维护，见其仓库的 [dsh-plugin 目录](https://github.com/YCTS-otree/VK-1) |
+| 🌐 **DSH 网页插件** · [@YCTS-otree](https://github.com/YCTS-otree) | 社区维护 | DSH bundle（JS） | 把 D-16BVM 移植进 DSH，支持与其它余额插件一键互切 |
+| 🌐 **DSH 网页插件** · [@TsukiKenga](https://github.com/TsukiKenga) | 社区维护 | DSH bundle（JS） | 五角色可切换 · 扣费步长可配 · 6 路音效各自调节 |
 | 🌐 **独立网页嵌入** | **v0.1.1** | 普通网页 JS + 可选 Python 余额服务 | 不依赖 DSH，可放进自己的网页，见下文「网页嵌入」 |
 
 Windows 版与 macOS 版**互不依赖**，各自独立运行；都只访问 DeepSeek 官方接口，不联网上传任何数据。网页插件版是第三方移植，见下。
@@ -119,7 +120,8 @@ Windows 版与 macOS 版**互不依赖**，各自独立运行；都只访问 Dee
 
 | 版本 | 目录 | 状态 | 内容 |
 | --- | --- | --- | --- |
-| **v3** | [`大肥鱼桌宠改_D-16BVM`](windows) | **当前版本** | 表情差分 · 铁盆 · 多目标火控雷达 · PDF 说明书 |
+| **v3.1** | [`windows/`](windows) | **当前版本** | 修复红闪时整机鼠标发黏、调小尺寸后旧轮廓残影；说明书改用 Markdown |
+| v3 | [`大肥鱼桌宠改_D-16BVM`](windows) | 保留 | 表情差分 · 铁盆 · 多目标火控雷达 · PDF 说明书 |
 | v2 | [`大肥鱼桌宠改_D-16B`](https://github.com/vkmich16/vk-1/tree/windows-d16b/windows) | 保留 | 拖拽惯性 · DSH 风格菜单第二版 |
 | v1 | [`大肥鱼桌宠初代_D-16A`](https://github.com/vkmich16/vk-1/tree/windows-d16a/windows) | 存档 | 初版（8 个源文件与下方「原版」目录相同，另多一份 README） |
 | — | [`原版（Windows版）`](https://github.com/vkmich16/vk-1/tree/windows-original/windows) | 原版存档 | 本项目的起点版本；已经过社区改进（见下文），但其中的 `DSH余额桌宠.zip` 仍为最初发布的压缩包 |
@@ -148,14 +150,12 @@ Windows 版与 macOS 版**互不依赖**，各自独立运行；都只访问 Dee
 
 ### 文档
 
-`Windows/` 里有两份说明，**每份都有 PDF / TXT / Markdown 三种格式，内容一样**：
+`windows/` 里有两份说明，都是 **Markdown**（UTF-8，GitHub / VS Code 直接看）：
 
 | 文档 | 内容 | 建议 |
 | --- | --- | --- |
-| **先看这里（快速开始）** | 5 页，带插图，只讲功能 | 👍 **先看这个** |
-| **说明文档** | 11 页，完整说明：菜单、账目规则、环境变量、排错、原理 | 想深入了解时看 |
-
-`.txt` 用记事本直接打开；`.md` 适合 GitHub / VS Code；`.pdf` 排版最好、带插图。
+| **先看这里（快速开始）**.md | 只讲怎么用 | 👍 **先看这个** |
+| **说明文档**.md | 完整说明：菜单、账目规则、表情/铁盆/雷达/摸头、峰谷副屏、环境变量、排错、原理 | 想深入了解时看 |
 
 ---
 
@@ -252,17 +252,21 @@ macOS 版基于本仓库中的 Windows 原版移植，感谢原作者。原版�
 
 ## 🌐 DSH 网页插件版（社区维护）
 
-由 [@YCTS-otree](https://github.com/YCTS-otree) 把 `大肥鱼桌宠改_D-16BVM` 移植成了
-**DSH（DeepSeek Harness）网页插件**，作为 DSH 的一个 bundle 运行：
+本仓库的 `大肥鱼桌宠改_D-16BVM` 被**多位社区成员各自**移植成了
+**DSH（DeepSeek Harness）网页插件**，作为 DSH 的一个 bundle 运行。两版独立维护、各自演进，选一个用即可：
 
-**→ [`YCTS-otree/VK-1` · `dsh-plugin/` 目录](https://github.com/YCTS-otree/VK-1)**
+| 移植者 | 在哪 | 这版的特色 |
+| --- | --- | --- |
+| [@YCTS-otree](https://github.com/YCTS-otree) | [`YCTS-otree/VK-1` · `dsh-plugin/`](https://github.com/YCTS-otree/VK-1) | 最早的一版；支持与 DSH 里其它余额插件**一键互切**（热生效，不需要刷新页面） |
+| [@TsukiKenga](https://github.com/TsukiKenga) | [`TsukiKenga/dsh-balance-pet-extend`](https://github.com/TsukiKenga/dsh-balance-pet-extend) | **五个角色**可右键切换；**扣费步长可配**（0.01–100 元，差额分拍 + 余数补拍）；**6 路音效**可各自调音量、上传自定义音频并截取片段 |
 
-- 逐分结算（0.01 / 0.2s / 单轮 40 次上限）、四种表情的优先级状态机、掉盆按落高的弹跳、
-  铁盆扣头与双击取下、火控雷达名牌与 10s 批量锁定 —— 行为按本仓库的实现对齐
-- 额外支持与 DSH 里其它余额显示插件**一键互切**（热生效，不需要刷新页面）
-- ⚠️ **形态差异**：网页插件没有原生置顶窗口、托盘和**屏幕角吸附**（只能吸附窗口角）；
-  透明像素点击穿透仍然保留
-- 该插件**由 @YCTS-otree 独立维护**，不属于本仓库内容 —— 使用问题和建议请到他的仓库反馈
+两版都按本仓库的实现对齐：逐分结算（0.01 / 0.2s / 单轮 40 次上限）、四种表情的优先级状态机、
+掉盆按落高的弹跳、铁盆扣头与双击取下、火控雷达名牌与 10s 批量锁定。
+
+⚠️ **形态差异**：网页插件没有原生置顶窗口、托盘和**屏幕角吸附**（只能吸附窗口角）；
+透明像素点击穿透仍然保留。
+
+各版本由各自的作者维护，不属于本仓库内容 —— 使用问题和建议请到对应仓库反馈。
 
 ## 贡献者
 
@@ -272,6 +276,7 @@ macOS 版基于本仓库中的 Windows 原版移植，感谢原作者。原版�
 | 🍎 macOS 版 | [@Andromedahk](https://github.com/Andromedahk) | 从 Windows 原版移植到 Swift + AppKit，独立维护 |
 | 🪟 Windows 旧版修复 | [@sa2360](https://github.com/sa2360) | DSH 账号凭证支持 · 音效改用绝对路径与返回码判断（[PR #2](https://github.com/VKmich16/VK-1/pull/2)） |
 | 🌐 DSH 网页插件版 | [@YCTS-otree](https://github.com/YCTS-otree) | 把 D-16BVM 移植成 DSH bundle，独立维护（[dsh-plugin 目录](https://github.com/YCTS-otree/VK-1)） |
+| 🌐 DSH 网页插件版 | [@TsukiKenga](https://github.com/TsukiKenga) | 同期移植并对 DSH bundle 做了扩展（五角色 / 步长可配 / 分音效），独立维护（[仓库](https://github.com/TsukiKenga/dsh-balance-pet-extend)） |
 | Windows 原版 | — | 见 `原版（Windows版）/` |
 
 ## 许可
